@@ -1,0 +1,3677 @@
+=== FILE: backend/.env.example ===
+# ---------------------------------------------------------------- backend/.env.example
+# Copy this file to backend/.env and fill in your own values. NEVER commit backend/.env.
+
+# Database: local MongoDB (free) or a free MongoDB Atlas connection string
+MONGO_URL="mongodb://localhost:27017"
+DB_NAME="swachh_chiplun"
+
+# Frontend address(es) allowed to call this backend (comma separated)
+CORS_ORIGINS="http://localhost:3000"
+
+# Google Gemini (free tier) — create a key at https://aistudio.google.com/apikey
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-3.5-flash
+# Used automatically when the main model's free daily quota is used up
+GEMINI_FALLBACK_MODEL=gemini-3.5-flash-lite
+
+# Clerk sign-in (free) — https://dashboard.clerk.com → your app → API Keys
+CLERK_PUBLISHABLE_KEY=pk_test_xxxxxxxxxxxxxxxx
+CLERK_SECRET_KEY=sk_test_xxxxxxxxxxxxxxxx
+
+# The ONE admin of the app (must be the verified primary email of a Clerk account)
+ADMIN_EMAIL=you@example.com
+
+# Optional second lock for the admin panel (asked once per sign-in session)
+ADMIN_PASSCODE=choose-a-strong-passcode
+
+
+=== FILE: backend/clerk_auth.py ===
+"""Emergent-managed Clerk auth, inert until CLERK_PUBLISHABLE_KEY/CLERK_SECRET_KEY
+are set: /api/clerk/config for the frontend, the /api/__clerk production relay
+(zero DNS per app), and the require_user dependency for protected routes."""
+
+import os
+from functools import lru_cache
+
+import jwt
+import requests
+from fastapi import APIRouter, HTTPException, Request, Response
+from requests.adapters import HTTPAdapter
+from starlette.concurrency import run_in_threadpool
+from urllib3.util.retry import Retry
+
+CLERK_FRONTEND_API = "https://frontend-api.clerk.dev"
+CLERK_BACKEND_API = "https://api.clerk.com/v1"
+PROXY_PATH = "/api/__clerk"
+
+# Per-hop headers are never relayed; requests decodes the body, so its encoding goes too.
+_HOP_HEADERS = {
+    "host", "connection", "keep-alive", "content-length", "transfer-encoding",
+    "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate",
+    "content-encoding",
+}
+
+clerk_router = APIRouter(prefix="/api")
+_http = requests.Session()
+# Clerk's edge closes idle keep-alive connections; retry idempotent calls on a dropped one.
+_retry = Retry(total=2, connect=2, read=2, status=0, backoff_factor=0.1,
+               allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}))
+_http.mount("https://", HTTPAdapter(pool_maxsize=40, max_retries=_retry))  # matches the threadpool size
+
+
+def _publishable_key() -> str:
+    return os.environ.get("CLERK_PUBLISHABLE_KEY", "")
+
+
+def _secret_key() -> str:
+    return os.environ.get("CLERK_SECRET_KEY", "")
+
+
+def _is_production() -> bool:
+    # Only production instances are served through the /api/__clerk proxy.
+    return _publishable_key().startswith("pk_live_")
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+@clerk_router.get("/clerk/config")
+def clerk_config():
+    """What the frontend needs to start Clerk (the publishable key is public)."""
+    key = _publishable_key()
+    return {
+        "enabled": bool(key and _secret_key()),
+        "publishable_key": key,
+        "proxy_url": PROXY_PATH if _is_production() else "",
+    }
+
+
+@clerk_router.api_route("/__clerk/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def clerk_proxy(path: str, request: Request):
+    """Relay Clerk's Frontend API through this app's own domain."""
+    if not _is_production():
+        raise HTTPException(status_code=404)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
+    headers["Clerk-Proxy-Url"] = f"https://{host.split(',')[0].strip()}{PROXY_PATH}"
+    headers["Clerk-Secret-Key"] = _secret_key()
+    headers["X-Forwarded-For"] = _client_ip(request)
+    headers["Accept-Encoding"] = "gzip"  # requests cannot decode brotli
+
+    try:
+        upstream = await run_in_threadpool(
+            _http.request,
+            request.method,
+            f"{CLERK_FRONTEND_API}/{path}",
+            params=list(request.query_params.multi_items()),
+            headers=headers,
+            data=await request.body(),
+            allow_redirects=False,
+            timeout=30,
+        )
+    except requests.RequestException:
+        # Clerk's frontend retries a 502; an unhandled error would be a bare 500.
+        return Response(status_code=502)
+    response = Response(content=upstream.content, status_code=upstream.status_code)
+    raw = upstream.raw.headers
+    for name in {n.lower() for n in raw.keys()} - _HOP_HEADERS:
+        # getlist keeps every Set-Cookie separate; joining them breaks sessions.
+        for value in raw.getlist(name):
+            response.raw_headers.append((name.encode(), value.encode()))
+    return response
+
+
+@lru_cache(maxsize=1)
+def _jwks_client(secret_key: str) -> jwt.PyJWKClient:
+    # Caches Clerk's signing keys and refetches when it meets a new key id.
+    return jwt.PyJWKClient(
+        f"{CLERK_BACKEND_API}/jwks",
+        # Clerk's edge rejects urllib's default User-Agent (Cloudflare 1010).
+        headers={"Authorization": f"Bearer {secret_key}", "User-Agent": "emergent-clerk-auth"},
+        lifespan=3600,
+        timeout=10,
+    )
+
+
+def verify_session_token(token: str) -> dict:
+    """Return the verified claims of a Clerk session token, or raise 401."""
+    try:
+        key = _jwks_client(_secret_key()).get_signing_key_from_jwt(token).key
+        return jwt.decode(token, key=key, algorithms=["RS256"], leeway=5)
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+
+def require_user(request: Request) -> dict:
+    """FastAPI dependency: the signed-in user from `Authorization: Bearer`
+    (frontend getToken()) or Clerk's `__session` cookie; user["user_id"] is stable."""
+    if not _secret_key():
+        raise HTTPException(status_code=503, detail="Clerk is not configured")
+    auth = request.headers.get("authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else request.cookies.get("__session", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not signed in")
+    claims = verify_session_token(token)
+    return {"user_id": claims["sub"], "session_id": claims.get("sid"), "claims": claims}
+
+
+=== FILE: backend/lib/__init__.py ===
+
+
+=== FILE: backend/lib/ai.py ===
+"""Shared AI text helpers (languages + safe fallback replies).
+
+The AI calls themselves go through lib/gemini.py (Google Gemini, free tier).
+"""
+
+LANGUAGE_NAMES = {
+    "en": "English",
+    "hi": "Hindi, written in Devanagari script",
+    "mr": "Marathi, written in Devanagari script",
+}
+
+# Canned safe answers if the model call fails outright — per language.
+FALLBACK_REPLIES = {
+    "en": "Sorry, I could not reach the AI service just now. General rule: keep the item dry, "
+          "segregate it from kitchen waste, and hand it over at your nearest collection centre. "
+          "For electronics, use only an authorised e-waste recycler; never burn or dump waste in the open.",
+    "hi": "क्षमा करें, अभी AI सेवा से संपर्क नहीं हो पा रहा। सामान्य नियम: वस्तु को सूखा रखें, रसोई के कचरे से अलग रखें "
+          "और निकटतम संग्रहण केंद्र में जमा करें। इलेक्ट्रॉनिक्स के लिए केवल अधिकृत ई-वेस्ट रीसाइक्लर का उपयोग करें; "
+          "कचरा कभी जलाएं या खुले में न फेंकें।",
+    "mr": "क्षमस्व, सध्या AI सेवेशी संपर्क होऊ शकत नाही. सामान्य नियम: वस्तू कोरडी ठेवा, स्वयंपाकघराच्या कचऱ्यापासून वेगळी ठेवा "
+          "आणि जवळच्या संकलन केंद्रात जमा करा. इलेक्ट्रॉनिक्ससाठी फक्त अधिकृत ई-वेस्ट रीसायक्लर वापरा; कचरा कधीही जाळू नका "
+          "किंवा उघड्यावर टाकू नका.",
+}
+
+
+=== FILE: backend/lib/auth.py ===
+"""Roles + admin authorization on top of Emergent-managed Clerk sign-in.
+
+Clerk owns identity (passwords, Google, sessions, signed JWTs). The app owns roles:
+each person has a `users` doc keyed by the Clerk user id, holding `role`. The role
+is read from the database on EVERY request — never from the token or the body.
+"""
+
+import hashlib
+import logging
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import requests
+from fastapi import Depends, HTTPException
+from pymongo import ReturnDocument
+from starlette.concurrency import run_in_threadpool
+
+from clerk_auth import require_user
+from lib.db import db
+
+logger = logging.getLogger(__name__)
+
+# The role list is code (ships on every publish). Highest first; keep `admin`.
+ROLES = ["admin", "citizen"]
+DEFAULT_ROLE = "citizen"
+RETIRED_ROLES: dict[str, str] = {}  # removed role -> replacement; keep entries
+RANK = {r: len(ROLES) - i for i, r in enumerate(ROLES)}
+
+# Which Clerk instance signed the person in (first publish copies preview users to Live).
+ENV = "live" if os.environ.get("CLERK_PUBLISHABLE_KEY", "").startswith("pk_live_") else "preview"
+IN_ENV = {"env": {"$in": [ENV, None]}}
+
+LAST_SEEN_EVERY = timedelta(minutes=5)
+
+
+def effective_role(role) -> str:
+    role = RETIRED_ROLES.get(role, role)
+    return role if role in ROLES else DEFAULT_ROLE
+
+
+async def move_retired_roles() -> None:
+    for old, new in RETIRED_ROLES.items():
+        await db.users.update_many({"role": old}, {"$set": {"role": new}})
+
+
+def _fetch_clerk_user(user_id: str) -> dict:
+    r = requests.get(
+        f"https://api.clerk.com/v1/users/{user_id}",
+        timeout=10,
+        headers={"Authorization": f"Bearer {os.environ['CLERK_SECRET_KEY']}", "User-Agent": "emergent-app"},
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _profile(clerk_user: dict) -> tuple[str, str, bool]:
+    """(primary email, display name, is-admin-by-verified-ADMIN_EMAIL)."""
+    admins = {e.strip().lower() for e in os.environ.get("ADMIN_EMAIL", "").split(",") if e.strip()}
+    emails = clerk_user.get("email_addresses") or []
+    primary_id = clerk_user.get("primary_email_address_id")
+    primary = next((e for e in emails if e.get("id") == primary_id), emails[0] if emails else {})
+    email = (primary.get("email_address") or "").lower()
+    name = " ".join(p for p in (clerk_user.get("first_name"), clerk_user.get("last_name")) if p) or email
+    is_admin = any(
+        e["email_address"].lower() in admins and (e.get("verification") or {}).get("status") == "verified"
+        for e in emails
+    )
+    return email, name, is_admin
+
+
+async def current_member(user: dict = Depends(require_user)) -> dict:
+    """The signed-in person with their role, created on first sign-in."""
+    uid = user["user_id"]
+    now = datetime.now(timezone.utc)
+    member = await db.users.find_one({"user_id": uid}, {"_id": 0})
+    if member is None or not member.get("role") or not member.get("email"):
+        # One Clerk lookup on first sign-in (never per request). Errors propagate so
+        # the next request retries instead of saving a wrong role.
+        clerk_user = await run_in_threadpool(_fetch_clerk_user, uid)
+        email, name, _ = _profile(clerk_user)
+        role = DEFAULT_ROLE  # admin rights are NOT stored roles: see require_admin
+        await db.users.update_one(
+            {"user_id": uid, "role": {"$in": [None, ""]}}, {"$set": {"role": role}}
+        )
+        member = await db.users.find_one_and_update(
+            {"user_id": uid},
+            {
+                "$setOnInsert": {"user_id": uid, "role": role, "created_at": now},
+                "$set": {"email": email, "name": name},
+            },
+            upsert=True,
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+    updates: dict = {}
+    if member.get("env") != ENV:
+        updates["env"] = ENV
+    last_seen = member.get("last_seen")
+    if last_seen is not None and last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    if last_seen is None or now - last_seen > LAST_SEEN_EVERY:
+        updates["last_seen"] = now
+    if updates:
+        await db.users.update_one({"user_id": uid}, {"$set": updates})
+    return {**member, **updates, "env": ENV, "role": DEFAULT_ROLE, "session_id": user.get("session_id")}
+
+
+def require_role(*roles: str):
+    async def check(member: dict = Depends(current_member)) -> dict:
+        if member["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Not allowed")
+        return member
+
+    return check
+
+
+# ---------------------------------------------------------------- single admin
+# Exactly ONE admin: the Clerk user whose PRIMARY email equals ADMIN_EMAIL and is
+# VERIFIED. Decided from Clerk on every admin call; no stored role can grant it.
+PASSCODE_MAX_FAILS = 5
+PASSCODE_LOCK = timedelta(minutes=15)
+
+
+def admin_email() -> str:
+    return os.environ.get("ADMIN_EMAIL", "").split(",")[0].strip().lower()
+
+
+def is_verified_primary_admin(clerk_user: dict) -> bool:
+    target = admin_email()
+    if not target:
+        return False
+    pid = clerk_user.get("primary_email_address_id")
+    primary = next((e for e in clerk_user.get("email_addresses") or [] if e.get("id") == pid), None)
+    return bool(
+        primary
+        and (primary.get("email_address") or "").strip().lower() == target
+        and (primary.get("verification") or {}).get("status") == "verified"
+    )
+
+
+async def is_admin(member: dict) -> bool:
+    try:
+        clerk_user = await run_in_threadpool(_fetch_clerk_user, member["user_id"])
+    except Exception:
+        logger.warning("admin check: Clerk lookup failed")
+        return False
+    return is_verified_primary_admin(clerk_user)
+
+
+def passcode_hash(value: str | None = None) -> str | None:
+    raw = os.environ.get("ADMIN_PASSCODE", "") if value is None else value
+    return hashlib.sha256(raw.encode()).hexdigest() if raw else None
+
+
+async def admin_identity(member: dict = Depends(current_member)) -> dict:
+    if not await is_admin(member):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    return member
+
+
+async def require_admin(member: dict = Depends(admin_identity)) -> dict:
+    """Every admin API: verified ADMIN_EMAIL + (if ADMIN_PASSCODE set) unlocked session."""
+    if passcode_hash():
+        sid = member.get("session_id") or ""
+        if not await db.admin_unlocks.find_one({"_id": sid, "user_id": member["user_id"]}):
+            raise HTTPException(status_code=423, detail="Admin passcode required")
+    return {**member, "role": "admin"}
+
+
+async def audit(admin: dict, action: str, target: str) -> None:
+    """Append-only log of every admin write — shown on the admin Audit log page."""
+    await db.admin_audit.insert_one(
+        {
+            "id": str(uuid.uuid4()),
+            "admin_email": admin.get("email", ""),
+            "action": action,
+            "target": target,
+            "at": datetime.now(timezone.utc),
+        }
+    )
+
+
+=== FILE: backend/lib/dates.py ===
+"""Server-side date helpers. The pod clock is UTC — anchor "today" here, never in the browser."""
+
+import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+def today_iso(tz: str | None = None) -> str:
+    """Today's date as YYYY-MM-DD in `tz` (default: APP_TZ env, else UTC)."""
+    zone = tz or os.environ.get("APP_TZ", "UTC")
+    return datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d")
+
+
+=== FILE: backend/lib/db.py ===
+"""Shared Mongo handle — import `client`/`db` from here (server.py, routers, seed.py)."""
+
+import logging
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ASCENDING, DESCENDING, IndexModel
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+mongo_url = os.environ["MONGO_URL"]
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ["DB_NAME"]]
+
+logger = logging.getLogger(__name__)
+
+# One entry per collection: every field a route filters, sorts, or dedupes on. Applied by ensure_indexes() at startup.
+INDEXES: dict[str, list[IndexModel]] = {
+    "status_checks": [IndexModel([("timestamp", DESCENDING)], name="timestamp_desc")],
+    "scans": [
+        IndexModel([("created_at", DESCENDING)], name="created_at_desc"),
+        IndexModel([("user_id", ASCENDING), ("created_at", DESCENDING)], name="user_created"),
+    ],
+    "users": [IndexModel([("user_id", ASCENDING)], name="user_id", unique=True)],
+    "guidelines": [IndexModel([("key", ASCENDING)], name="key", unique=True)],
+    "feedback": [
+        IndexModel([("user_id", ASCENDING), ("created_at", DESCENDING)], name="user_created"),
+        IndexModel([("status", ASCENDING), ("created_at", DESCENDING)], name="status_created"),
+    ],
+    "admin_audit": [IndexModel([("at", DESCENDING)], name="at_desc")],
+    "tips": [IndexModel([("id", ASCENDING)], name="id", unique=True)],
+    # Doorstep Garbage Vehicle (DEMO) — separate collections, never counted on the real dashboards
+    "pickup_spots": [IndexModel([("user_id", ASCENDING)], name="user_id", unique=True)],
+    "pickup_alerts": [IndexModel([("user_id", ASCENDING), ("at", DESCENDING)], name="user_at")],
+    "demo_routes": [IndexModel([("id", ASCENDING)], name="id", unique=True)],
+    "demo_users": [IndexModel([("id", ASCENDING)], name="id", unique=True)],
+    "demo_trips": [IndexModel([("id", ASCENDING)], name="id", unique=True), IndexModel([("created_at", DESCENDING)], name="created_desc")],
+    "facilities": [
+        IndexModel([("id", ASCENDING)], name="id", unique=True),
+        IndexModel([("source", ASCENDING), ("fetched_at", DESCENDING)], name="source_fetched"),
+    ],
+}
+
+
+async def ensure_indexes() -> None:
+    for collection, models in INDEXES.items():
+        for model in models:  # one at a time so a bad spec skips only itself
+            try:
+                await db[collection].create_indexes([model])
+            except Exception as exc:  # never block boot on an index; the log line names what to fix
+                logger.error("ensure_indexes(%s.%s): %s", collection, model.document["name"], exc)
+
+
+=== FILE: backend/lib/doorstep.py ===
+"""Doorstep Garbage Vehicle — DEMO ONLY simulation engine.
+
+No background job: the vehicle position is computed from the trip's clock (start time,
+speed, pauses) every time a page polls, and pin statuses/alerts are advanced then.
+Each pin is alerted/collected at most once per trip (atomic conditional updates).
+"""
+
+import math
+import uuid
+from datetime import datetime, timezone
+
+from lib.db import db
+
+BASE_SPEED_MS = 20_000 / 3600  # simulated truck: 20 km/h, multiplied by the 1x/5x/10x demo speed
+COLLECT_M = 60  # vehicle this close to a pin with waste -> collected
+ON_ROUTE_M = 150  # pins further than this from the path are never auto-collected
+FEED_MAX = 60
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime | None) -> str:
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def dist_m(a: dict, b: dict) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(a["lat"]), math.radians(b["lat"])
+    dp, dl = p2 - p1, math.radians(b["lng"] - a["lng"])
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(h)))
+
+
+def cumulative(path: list[dict]) -> list[float]:
+    out = [0.0]
+    for a, b in zip(path, path[1:]):
+        out.append(out[-1] + dist_m(a, b))
+    return out
+
+
+def point_at(path: list[dict], cum: list[float], d: float) -> dict:
+    if d <= 0:
+        return dict(path[0])
+    if d >= cum[-1]:
+        return dict(path[-1])
+    for i in range(1, len(cum)):
+        if cum[i] >= d:
+            seg = cum[i] - cum[i - 1] or 1
+            t = (d - cum[i - 1]) / seg
+            a, b = path[i - 1], path[i]
+            return {"lat": a["lat"] + (b["lat"] - a["lat"]) * t, "lng": a["lng"] + (b["lng"] - a["lng"]) * t}
+    return dict(path[-1])
+
+
+def project(path: list[dict], cum: list[float], p: dict) -> tuple[float, float]:
+    """(distance along path of the closest point, distance from p to the path) in metres."""
+    best = (0.0, float("inf"))
+    k = math.cos(math.radians(p["lat"]))
+    for i in range(1, len(path)):
+        a, b = path[i - 1], path[i]
+        ax, ay = a["lng"] * k, a["lat"]
+        bx, by = b["lng"] * k, b["lat"]
+        px, py = p["lng"] * k, p["lat"]
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+        q = {"lat": a["lat"] + (b["lat"] - a["lat"]) * t, "lng": a["lng"] + (b["lng"] - a["lng"]) * t}
+        off = dist_m(p, q)
+        if off < best[1]:
+            best = (cum[i - 1] + (cum[i] - cum[i - 1]) * t, off)
+    return best
+
+
+def speed_ms(trip: dict) -> float:
+    return BASE_SPEED_MS * int(trip.get("speed", 1))
+
+
+def eta_minutes(distance: float, trip: dict) -> int:
+    return max(1, math.ceil(distance / speed_ms(trip) / 60))
+
+
+def progress_m(trip: dict, at: datetime | None = None) -> float:
+    """Distance travelled along the path (auto mode) from the trip clock."""
+    elapsed = float(trip.get("elapsed_s", 0.0))
+    if trip.get("state") == "running" and trip.get("mode") == "auto" and trip.get("resumed_at"):
+        resumed = trip["resumed_at"]
+        if resumed.tzinfo is None:
+            resumed = resumed.replace(tzinfo=timezone.utc)
+        elapsed += ((at or now()) - resumed).total_seconds()
+    return elapsed * speed_ms(trip)
+
+
+def vehicle_pos(trip: dict) -> dict:
+    if trip.get("mode") == "manual" and trip.get("manual_pos"):
+        return trip["manual_pos"]
+    return point_at(trip["path"], trip["cum"], progress_m(trip))
+
+
+def minutes_text(minutes: int) -> str:
+    return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+
+
+def alert_texts(minutes: int) -> tuple[str, str]:
+    return (
+        f"The garbage vehicle is about {minutes_text(minutes)} away. Please bring your waste down.",
+        f"कचरा गाडी सुमारे {minutes} मिनिटांत पोहोचेल. कृपया तुमचा कचरा खाली आणा.",
+    )
+
+
+async def active_trip() -> dict | None:
+    """The latest demo trip (running, paused, or just finished/stopped)."""
+    return await db.demo_trips.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+
+
+async def all_pins() -> list[dict]:
+    """Demo users + real users who saved a spot, as raw pin dicts."""
+    pins: list[dict] = []
+    async for u in db.demo_users.find({}, {"_id": 0}).sort("created_at", 1):
+        pins.append(
+            {
+                "key": f"demo_{u['id']}",
+                "kind": "demo",
+                "name": u["name"],
+                "label": u.get("label", ""),
+                "lat": u["lat"],
+                "lng": u["lng"],
+                "alert_m": u.get("alert_m", 500),
+                "alerts_on": True,
+                "waste_types": u.get("waste_types", []),
+                "has_waste": u.get("has_waste", True),
+            }
+        )
+    spots = await db.pickup_spots.find({}, {"_id": 0}).to_list(2000)
+    names = {
+        u["user_id"]: (u.get("name") or u.get("email") or "Real user")
+        async for u in db.users.find({"user_id": {"$in": [s["user_id"] for s in spots]}}, {"_id": 0})
+    }
+    for s in spots:
+        req = s.get("request") or {}
+        pins.append(
+            {
+                "key": f"real_{s['user_id']}",
+                "kind": "real",
+                "user_id": s["user_id"],
+                "name": names.get(s["user_id"], "Real user"),
+                "label": s.get("label", ""),
+                "lat": s["lat"],
+                "lng": s["lng"],
+                "alert_m": s.get("alert_m", 500),
+                "alerts_on": s.get("alerts_on", True),
+                "waste_types": req.get("waste_types", []),
+                "has_waste": bool(req) and req.get("status") != "collected",
+                "req_status": req.get("status"),
+            }
+        )
+    return pins
+
+
+def pin_status(pin: dict, trip: dict | None) -> str:
+    st = ((trip or {}).get("pins") or {}).get(pin["key"], {})
+    if st.get("collected_at"):
+        return "collected"
+    if pin["kind"] == "real":
+        rs = pin.get("req_status")
+        if rs == "collected":
+            return "collected"
+        if st.get("alerted_at") or rs == "near":
+            return "near"
+        return "requested" if rs else "waiting"
+    if not pin.get("has_waste"):
+        return "waiting"  # nothing to collect today
+    return "near" if st.get("alerted_at") else "requested"
+
+
+async def push_feed(trip_id: str, text: str) -> None:
+    await db.demo_trips.update_one(
+        {"id": trip_id},
+        {"$push": {"feed": {"$each": [{"text": text, "at": iso(now())}], "$slice": -FEED_MAX}}},
+    )
+
+
+async def mark_collected(trip: dict, pin: dict, by: str = "auto") -> bool:
+    res = await db.demo_trips.update_one(
+        {"id": trip["id"], f"pins.{pin['key']}.collected_at": {"$exists": False}},
+        {"$set": {f"pins.{pin['key']}.collected_at": iso(now())}},
+    )
+    if res.modified_count != 1:
+        return False
+    if pin["kind"] == "real":
+        await db.pickup_spots.update_one(
+            {"user_id": pin["user_id"], "request": {"$ne": None}}, {"$set": {"request.status": "collected"}}
+        )
+    how = "by the driver" if by == "driver" else "automatically"
+    await push_feed(trip["id"], f"{pin['name']} — waste collected ({how})")
+    return True
+
+
+async def advance(trip: dict | None) -> dict | None:
+    """Move the simulation forward to 'now': alerts, collections, end of trip."""
+    if not trip or trip.get("state") not in ("running", "paused"):
+        return trip
+    pos = vehicle_pos(trip)
+    pins = await all_pins()
+    state = trip.get("pins") or {}
+    auto = trip.get("mode") != "manual"
+    travelled = progress_m(trip)
+    for pin in pins:
+        d = dist_m(pos, pin)
+        along, off = project(trip["path"], trip["cum"], pin)
+        # the vehicle moves up to ~170 m between polls at 10x: anything on the route it has
+        # already passed counts as reached (alert first, then collect)
+        passed = auto and off <= ON_ROUTE_M and along <= travelled
+        st = state.get(pin["key"], {})
+        if pin["alerts_on"] and (d <= pin["alert_m"] or passed) and not st.get("alerted_at") and not st.get("collected_at"):
+            res = await db.demo_trips.update_one(
+                {"id": trip["id"], f"pins.{pin['key']}.alerted_at": {"$exists": False}},
+                {"$set": {f"pins.{pin['key']}.alerted_at": iso(now())}},
+            )
+            if res.modified_count == 1:
+                minutes = eta_minutes(d, trip)
+                label = "Real user " + pin["name"] if pin["kind"] == "real" else pin["name"]
+                await push_feed(trip["id"], f"{label} alerted at {int(round(d))} m, about {minutes_text(minutes)} away")
+                if pin["kind"] == "real":
+                    en, mr = alert_texts(minutes)
+                    await db.pickup_alerts.insert_one(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "user_id": pin["user_id"],
+                            "trip_id": trip["id"],
+                            "text_en": en,
+                            "text_mr": mr,
+                            "distance_m": int(round(d)),
+                            "eta_min": minutes,
+                            "at": now(),
+                        }
+                    )
+                    await db.pickup_spots.update_one(
+                        {"user_id": pin["user_id"], "request.status": "requested"},
+                        {"$set": {"request.status": "near"}},
+                    )
+        if pin["has_waste"] and (d <= COLLECT_M or passed) and not st.get("collected_at"):
+            await mark_collected(trip, pin)
+    if trip.get("mode") == "auto" and progress_m(trip) >= trip["cum"][-1]:
+        await finish_trip(trip, "finished")
+    return await db.demo_trips.find_one({"id": trip["id"]}, {"_id": 0})
+
+
+async def finish_trip(trip: dict, state: str) -> None:
+    fresh = await db.demo_trips.find_one({"id": trip["id"]}, {"_id": 0}) or trip
+    if fresh.get("state") in ("finished", "stopped"):
+        return
+    pins_state = fresh.get("pins") or {}
+    collected = sum(1 for v in pins_state.values() if v.get("collected_at"))
+    alerts = sum(1 for v in pins_state.values() if v.get("alerted_at"))
+    started = fresh.get("created_at")
+    if started is not None and started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    travelled = min(progress_m(fresh), fresh["cum"][-1]) if state == "finished" else progress_m(fresh)
+    summary = {
+        "facility_name": fresh.get("facility_name") or "the drop facility",
+        "distance_km": round(min(travelled, fresh["cum"][-1]) / 1000, 2),
+        "minutes": max(1, int(((now() - started).total_seconds() if started else 0) // 60)),
+        "collected": collected,
+        "alerts": alerts,
+        "stops": max(0, len(fresh.get("path", [])) - 2),
+    }
+    res = await db.demo_trips.update_one(
+        {"id": fresh["id"], "state": {"$in": ["running", "paused"]}},
+        {
+            "$set": {
+                "state": state,
+                "elapsed_s": progress_m(fresh) / speed_ms(fresh),
+                "resumed_at": None,
+                "summary": summary,
+                "ended_at": now(),
+            }
+        },
+    )
+    if res.modified_count == 1:
+        if state == "finished":
+            await push_feed(fresh["id"], f"Trip complete. Dropped at facility {summary['facility_name']}.")
+        else:
+            await push_feed(fresh["id"], "Trip stopped by admin.")
+
+
+=== FILE: backend/lib/gemini.py ===
+"""Google Gemini (free tier) — the single place the app talks to the AI.
+
+Key:   GEMINI_API_KEY  (backend .env only, never in code / logs / git)
+Model: GEMINI_MODEL    (default gemini-3.5-flash — free tier, accepts images)
+Every failure becomes an AIError with a friendly, user-facing message.
+"""
+
+import asyncio
+import logging
+import os
+
+import httpx
+from google import genai
+from google.genai import errors, types
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MODEL = "gemini-3.5-flash"
+
+FRIENDLY = {
+    "busy": "AI is busy, please try again in a minute.",
+    "key": "The AI service is not set up correctly (check GEMINI_API_KEY in backend/.env).",
+    "offline": "Cannot reach the AI service. Check your internet connection and try again.",
+    "invalid": "The AI could not read this clearly. Please retake a sharper, well-lit photo or add a short description.",
+    "error": "The AI service had a problem. Please try again.",
+}
+HTTP_STATUS = {"busy": 429, "key": 503, "offline": 503, "invalid": 422, "error": 502}
+
+
+class AIError(Exception):
+    def __init__(self, kind: str):
+        self.kind = kind
+        self.message = FRIENDLY[kind]
+        self.status = HTTP_STATUS[kind]
+        super().__init__(self.message)
+
+
+_client: genai.Client | None = None
+_client_key: str | None = None
+
+
+def model_name() -> str:
+    return os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
+
+
+def fallback_model() -> str:
+    return os.environ.get("GEMINI_FALLBACK_MODEL", "").strip()
+
+
+def is_configured() -> bool:
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def client() -> genai.Client:
+    global _client, _client_key
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise AIError("key")
+    if _client is None or key != _client_key:
+        _client, _client_key = genai.Client(api_key=key), key
+    return _client
+
+
+async def generate(contents, config: types.GenerateContentConfig):
+    """Gemini call with one automatic retry when the free tier is busy (429/503)."""
+    try:
+        return await _generate_once(contents, config, model_name())
+    except AIError as exc:
+        if exc.kind != "busy":
+            raise
+        backup = fallback_model()
+        if backup and backup != model_name():
+            # free-tier quota of the main model used up -> switch to the backup model
+            return await _generate_once(contents, config, backup)
+        await asyncio.sleep(3)
+        return await _generate_once(contents, config, model_name())
+
+
+async def _generate_once(contents, config: types.GenerateContentConfig, model: str):
+    """One Gemini call; maps SDK/network errors to AIError (never leaks the key)."""
+    try:
+        return await client().aio.models.generate_content(model=model, contents=contents, config=config)
+    except AIError:
+        raise
+    except errors.ClientError as exc:
+        text = str(exc).upper()
+        if exc.code in (401, 403) or "API_KEY" in text or "API KEY" in text:
+            logger.warning("Gemini rejected the API key (code %s)", exc.code)
+            raise AIError("key") from None
+        if exc.code == 429 or "RESOURCE_EXHAUSTED" in text:
+            logger.warning("Gemini free-tier rate limit reached")
+            raise AIError("busy") from None
+        if exc.code == 400 and ("IMAGE" in text or "INLINE" in text or "MIME" in text):
+            raise AIError("invalid") from None
+        if exc.code == 404:
+            logger.warning("Gemini model %s not found — check GEMINI_MODEL", model_name())
+            raise AIError("key") from None
+        logger.warning("Gemini client error %s", exc.code)
+        raise AIError("error") from None
+    except errors.ServerError as exc:
+        logger.warning("Gemini server error %s", exc.code)
+        raise AIError("busy") from None
+    except (httpx.HTTPError, TimeoutError, OSError):
+        logger.warning("Gemini unreachable (network)")
+        raise AIError("offline") from None
+    except errors.APIError as exc:
+        logger.warning("Gemini API error %s", getattr(exc, "code", "?"))
+        raise AIError("error") from None
+
+
+=== FILE: backend/lib/guidelines.py ===
+"""Admin-managed waste categories + disposal guidelines (Mongo `guidelines`).
+
+The six original categories are inserted once (marker doc in `settings`), so an
+admin who later deletes or edits one keeps that change. The classifier, the
+chat agent and the facility forms all read the ACTIVE guidelines from here.
+"""
+
+from datetime import datetime, timezone
+
+from lib.db import db
+
+DEFAULT_GUIDELINES = [
+    {
+        "key": "ewaste",
+        "name": "E-waste",
+        "description": "Phones, chargers, batteries, circuit boards, laptops, cables, CFL/LED bulbs and tube-lights. "
+        "E-Waste (Management) Rules 2022 — never in a regular bin.",
+        "examples": ["Mobile phone", "Charger", "Battery", "Tube light", "Laptop"],
+        "disposal_steps": [
+            "Keep the item intact and dry; do not break or burn it.",
+            "Remove personal data from phones and laptops.",
+            "Hand it to an authorised e-waste recycler or producer take-back point.",
+        ],
+        "hazards": ["Lithium batteries can catch fire if punctured", "Tube-lights contain mercury"],
+        "eco_points": 25,
+        "color": "#F59E0B",
+    },
+    {
+        "key": "recyclable",
+        "name": "Recyclable",
+        "description": "Clean plastic bottles/containers, paper, newspaper, glass, metal, cans, cardboard (dry waste).",
+        "examples": ["PET bottle", "Newspaper", "Cardboard box", "Glass jar", "Aluminium can"],
+        "disposal_steps": [
+            "Empty, rinse and dry the item.",
+            "Flatten boxes and bottles to save space.",
+            "Give it with dry waste to the municipal collector or a scrap dealer.",
+        ],
+        "hazards": [],
+        "eco_points": 10,
+        "color": "#3B82F6",
+    },
+    {
+        "key": "general",
+        "name": "General",
+        "description": "Non-recyclable soiled waste (used tissues, dirty wrappers, broken ceramics).",
+        "examples": ["Used tissue", "Dirty wrapper", "Broken ceramic cup"],
+        "disposal_steps": [
+            "Put it in the general (reject) waste bag.",
+            "Hand it to the municipal collection vehicle.",
+        ],
+        "hazards": [],
+        "eco_points": 5,
+        "color": "#64748B",
+    },
+    {
+        "key": "organic",
+        "name": "Organic",
+        "description": "Food scraps, vegetable peels, garden waste — compostable wet waste (SWM Rules 2016).",
+        "examples": ["Vegetable peels", "Leftover food", "Leaves", "Coconut shell"],
+        "disposal_steps": [
+            "Keep it separate from plastic and dry waste.",
+            "Compost at home or give it to the wet-waste collection.",
+        ],
+        "hazards": [],
+        "eco_points": 15,
+        "color": "#22C55E",
+    },
+    {
+        "key": "hazardous",
+        "name": "Hazardous",
+        "description": "Paints, solvents, pesticides, expired medicines, chemicals, aerosols (domestic hazardous waste).",
+        "examples": ["Paint can", "Pesticide bottle", "Expired medicines", "Aerosol can"],
+        "disposal_steps": [
+            "Safety first: keep it closed, labelled and away from children.",
+            "Never pour it into drains, soil or water.",
+            "Take it to the hazardous waste drop-off point.",
+        ],
+        "hazards": ["Toxic or flammable chemicals"],
+        "eco_points": 20,
+        "color": "#EF4444",
+    },
+    {
+        "key": "biomedical",
+        "name": "Biomedical",
+        "description": "Used masks, syringes, sanitary napkins, medical waste (Bio-Medical Waste Management Rules 2016).",
+        "examples": ["Used mask", "Syringe", "Sanitary napkin", "Bandage"],
+        "disposal_steps": [
+            "Safety first: wrap it in paper and seal it in a bag.",
+            "Mark it clearly as biomedical waste.",
+            "Hand it to the hospital drop or biomedical collection.",
+        ],
+        "hazards": ["Infection risk from used sharps and fluids"],
+        "eco_points": 20,
+        "color": "#F43F5E",
+    },
+]
+
+SEED_MARKER = "guidelines_seeded"
+
+
+async def ensure_default_guidelines() -> None:
+    if await db.settings.find_one({"_id": SEED_MARKER}):
+        return
+    now = datetime.now(timezone.utc)
+    for g in DEFAULT_GUIDELINES:
+        await db.guidelines.update_one(
+            {"key": g["key"]},
+            {"$setOnInsert": {**g, "id": f"cat-{g['key']}", "active": True, "updated_at": now}},
+            upsert=True,
+        )
+    await db.settings.update_one({"_id": SEED_MARKER}, {"$set": {"at": now}}, upsert=True)
+
+
+async def list_guidelines(active_only: bool = False) -> list[dict]:
+    await ensure_default_guidelines()
+    query = {"active": True} if active_only else {}
+    docs = await db.guidelines.find(query, {"_id": 0}).sort("name", 1).to_list(200)
+    for d in docs:
+        if d.get("updated_at") is not None and d["updated_at"].tzinfo is None:
+            d["updated_at"] = d["updated_at"].replace(tzinfo=timezone.utc)
+    return docs
+
+
+=== FILE: backend/lib/security.py ===
+"""Basic API security: per-user rate limits for the AI endpoints + secure headers."""
+
+import time
+from collections import defaultdict, deque
+
+from fastapi import Depends, HTTPException
+
+from lib.auth import current_member
+
+_hits: dict[str, deque] = defaultdict(deque)
+
+
+def rate_limit(bucket: str, limit: int, per_seconds: int = 60):
+    """FastAPI dependency: at most `limit` calls per user per window (in-memory)."""
+
+    async def check(member: dict = Depends(current_member)) -> dict:
+        key = f"{bucket}:{member['user_id']}"
+        now = time.monotonic()
+        q = _hits[key]
+        while q and now - q[0] > per_seconds:
+            q.popleft()
+        if len(q) >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests — please wait a minute and try again.")
+        q.append(now)
+        return member
+
+    return check
+
+
+SECURE_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(self), geolocation=(self), microphone=()",
+}
+
+
+async def secure_headers_middleware(request, call_next):
+    response = await call_next(request)
+    for k, v in SECURE_HEADERS.items():
+        response.headers.setdefault(k, v)
+    return response
+
+
+=== FILE: backend/models/__init__.py ===
+
+
+=== FILE: backend/models/admin.py ===
+"""Pydantic models for sign-in roles, feedback and the admin panel.
+
+Hand-written TS mirrors live in frontend/src/lib/adminTypes.ts — keep in sync.
+"""
+
+from datetime import datetime
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+from models.waste import Classification
+
+FeedbackKind = Literal["complaint", "suggestion", "facility_issue", "other"]
+FeedbackStatus = Literal["open", "in_progress", "resolved"]
+
+
+class Me(BaseModel):
+    user_id: str
+    email: str = ""
+    name: str = ""
+    role: str
+
+
+class UserRow(BaseModel):
+    user_id: str
+    email: str = ""
+    name: str = ""
+    role: str
+    created_at: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    scan_count: int = 0
+    feedback_count: int = 0
+
+
+class UsersResponse(BaseModel):
+    roles: List[str]
+    users: List[UserRow]
+
+
+class AdminGate(BaseModel):
+    admin_email: str
+    passcode_required: bool
+    unlocked: bool
+    locked_until: Optional[datetime] = None
+
+
+class PasscodeIn(BaseModel):
+    passcode: str = Field(min_length=1, max_length=200)
+
+
+class TipIn(BaseModel):
+    title: str = Field(min_length=2, max_length=120)
+    body: str = Field(min_length=2, max_length=2000)
+    category: str = ""  # optional category key the tip belongs to
+    active: bool = True
+
+
+class Tip(TipIn):
+    id: str
+    updated_at: Optional[datetime] = None
+
+
+class GuidelineIn(BaseModel):
+    key: str = Field(min_length=2, max_length=30, pattern=r"^[a-z][a-z0-9_]*$")
+    name: str = Field(min_length=2, max_length=60)
+    description: str = Field(default="", max_length=600)
+    examples: List[str] = []
+    disposal_steps: List[str] = []
+    hazards: List[str] = []
+    eco_points: int = Field(default=10, ge=0, le=100)
+    color: str = Field(default="#64748B", pattern=r"^#[0-9A-Fa-f]{6}$")
+    active: bool = True
+
+
+class Guideline(GuidelineIn):
+    id: str
+    updated_at: Optional[datetime] = None
+    facility_count: int = 0
+    scan_count: int = 0
+
+
+class FacilityIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    categories: List[str] = Field(min_length=1)
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    address: str = ""
+    phone: Optional[str] = None
+    hours: Optional[str] = None
+    accepts: List[str] = []
+    active: bool = True
+    type: str = Field(default="", max_length=60)  # e.g. E-waste centre, Scrap dealer
+
+
+class AdminFacility(FacilityIn):
+    id: str
+    source: str = "admin"
+
+
+class ActiveIn(BaseModel):
+    active: bool
+
+
+class FeedbackIn(BaseModel):
+    kind: FeedbackKind = "complaint"
+    message: str = Field(min_length=3, max_length=2000)
+
+
+class Feedback(BaseModel):
+    id: str
+    user_id: str
+    user_email: str = ""
+    user_name: str = ""
+    kind: FeedbackKind
+    message: str
+    status: FeedbackStatus = "open"
+    admin_reply: str = ""
+    replied_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class FeedbackReplyIn(BaseModel):
+    status: FeedbackStatus
+    admin_reply: str = Field(default="", max_length=2000)
+
+
+class AdminScan(Classification):
+    user_email: str = ""
+
+
+class ScanPage(BaseModel):
+    items: List[AdminScan]
+    total: int
+    page: int
+    page_size: int
+
+
+class DayCount(BaseModel):
+    date: str
+    count: int
+
+
+class ItemCount(BaseModel):
+    item_name: str
+    count: int
+
+
+class ActivityItem(BaseModel):
+    kind: str  # scan | feedback | signup
+    text: str
+    at: datetime
+
+
+class AdminStats(BaseModel):
+    total_users: int
+    total_scans: int
+    total_eco_points: int
+    total_feedback: int
+    open_feedback: int
+    active_facilities: int
+    total_facilities: int
+    low_confidence_scans: int
+    by_category: dict
+    daily: List[DayCount]
+    top_items: List[ItemCount]
+    recent: List[ActivityItem]
+
+
+class AuditEntry(BaseModel):
+    id: str
+    admin_email: str
+    action: str
+    target: str
+    at: datetime
+
+
+class DeleteResult(BaseModel):
+    deleted: int
+
+
+=== FILE: backend/models/doorstep.py ===
+"""Doorstep Garbage Vehicle — DEMO ONLY. Mirrors: frontend/src/lib/doorstepTypes.ts"""
+
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+AlertM = Literal[300, 500, 1000]
+PinStatus = Literal["waiting", "requested", "near", "collected"]
+
+
+class LatLng(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+# ---------------------------------------------------------------- user side
+class SpotIn(BaseModel):
+    label: str = Field(default="My pickup spot", max_length=80)
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    alert_m: AlertM = 500
+    alerts_on: bool = True
+
+
+class PickupRequestIn(BaseModel):
+    waste_types: List[str] = Field(min_length=1, max_length=6)
+    note: str = Field(default="", max_length=200)
+
+
+class PickupRequest(BaseModel):
+    waste_types: List[str]
+    note: str = ""
+    status: Literal["requested", "near", "collected"]
+    created_at: str
+
+
+class Spot(BaseModel):
+    label: str
+    lat: float
+    lng: float
+    alert_m: int
+    alerts_on: bool
+    request: Optional[PickupRequest] = None
+
+
+class PickupAlert(BaseModel):
+    id: str
+    text_en: str
+    text_mr: str
+    distance_m: int
+    eta_min: int
+    at: str
+
+
+class RouteView(BaseModel):
+    id: str
+    name: str
+    points: List[LatLng]
+    is_demo: bool = False
+
+
+class VehicleView(BaseModel):
+    lat: float
+    lng: float
+    state: Literal["running", "paused", "stopped", "finished"]
+    mode: Literal["auto", "manual"]
+    speed: int
+    path: List[LatLng]
+
+
+class PickupLive(BaseModel):
+    route: Optional[RouteView] = None
+    vehicle: Optional[VehicleView] = None
+    spot: Optional[Spot] = None
+    status: PinStatus = "waiting"
+    distance_m: Optional[int] = None
+    eta_min: Optional[int] = None
+    alerts: List[PickupAlert] = []
+
+
+class OkResponse(BaseModel):
+    ok: bool = True
+
+
+# ---------------------------------------------------------------- admin side
+class RouteIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    points: List[LatLng] = Field(min_length=2, max_length=60)  # start, stops in order, end
+    time_window: str = Field(default="", max_length=40)
+    facility_id: Optional[str] = None
+
+
+class Route(BaseModel):
+    id: str
+    name: str
+    points: List[LatLng]
+    time_window: str = ""
+    facility_id: Optional[str] = None
+    facility_name: str = ""
+    is_demo: bool = False
+
+
+class DemoUserIn(BaseModel):
+    name: str = Field(default="", max_length=60)
+    label: str = Field(default="", max_length=80)
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    alert_m: AlertM = 500
+    waste_types: List[str] = []
+    has_waste: bool = True
+
+
+class DemoUser(BaseModel):
+    id: str
+    name: str
+    label: str
+    lat: float
+    lng: float
+    alert_m: int
+    waste_types: List[str]
+    has_waste: bool
+    is_demo: bool = True
+
+
+class GenerateIn(BaseModel):
+    route_id: str
+    count: int = Field(default=12, ge=1, le=15)
+
+
+class TripStartIn(BaseModel):
+    route_id: str
+    speed: Literal[1, 5, 10] = 5
+    start: Optional[LatLng] = None
+
+
+class SpeedIn(BaseModel):
+    speed: Literal[1, 5, 10]
+
+
+class PinKeyIn(BaseModel):
+    pin_key: str
+
+
+class Pin(BaseModel):
+    key: str
+    kind: Literal["demo", "real"]
+    name: str
+    label: str
+    lat: float
+    lng: float
+    alert_m: int
+    waste_types: List[str]
+    status: PinStatus
+    distance_m: Optional[int] = None
+    eta_min: Optional[int] = None
+
+
+class FeedItem(BaseModel):
+    text: str
+    at: str
+
+
+class TripSummary(BaseModel):
+    facility_name: str
+    distance_km: float
+    minutes: int
+    collected: int
+    alerts: int
+    stops: int
+
+
+class AdminDoorstepState(BaseModel):
+    trip_id: Optional[str] = None
+    route_id: Optional[str] = None
+    vehicle: Optional[VehicleView] = None
+    progress_pct: int = 0
+    pins: List[Pin] = []
+    feed: List[FeedItem] = []
+    next_stops: List[Pin] = []
+    summary: Optional[TripSummary] = None
+
+
+class DemoDataCounts(BaseModel):
+    demo_users: int
+    demo_trips: int
+
+
+class ClearDemoIn(BaseModel):
+    phrase: str
+    confirm: bool
+
+
+=== FILE: backend/models/waste.py ===
+"""Pydantic v2 models for the Swachh Chiplun waste assistant.
+
+Every model here has a hand-written TS mirror in frontend/src/lib/types.ts —
+keep the two in sync in the same edit.
+"""
+
+import uuid
+from datetime import datetime
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+Language = Literal["en", "hi", "mr"]
+WasteCategory = Literal["ewaste", "recyclable", "general", "organic", "hazardous", "biomedical"]
+
+
+class ClassificationRequest(BaseModel):
+    image_base64: Optional[str] = None  # JPEG/PNG/WEBP, resized client-side
+    mime_type: str = "image/jpeg"
+    hint: Optional[str] = None  # text description or decoded barcode value
+    language: Language = "en"
+
+
+class Classification(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    item_name: str
+    category: str
+    subcategory: str = ""
+    confidence: float
+    disposal_steps: List[str] = []
+    hazards: List[str] = []
+    eco_tip: str = ""
+    eco_points: int = 0
+    needs_follow_up: bool = False
+    follow_up_question: str = ""
+    follow_up_options: List[str] = []
+    language: Language = "en"
+    hint: Optional[str] = None
+    created_at: datetime
+    category_label: str = ""  # admin-managed display name of the category
+    user_id: Optional[str] = None  # owner (None = demo scans made before sign-in existed)
+
+
+class ScanContext(BaseModel):
+    item_name: str
+    category: str
+
+
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    language: Language = "en"
+    history: List[ChatHistoryMessage] = []
+    scan_context: Optional[ScanContext] = None
+
+
+class Facility(BaseModel):
+    id: str
+    name: str
+    categories: List[str] = []
+    lat: float
+    lng: float
+    address: str = ""
+    phone: Optional[str] = None
+    hours: Optional[str] = None
+    accepts: List[str] = []
+    source: str = "seed"  # "seed" (curated Chiplun list) | "osm" (OpenStreetMap live) | "admin"
+    distance_m: Optional[float] = None
+    active: bool = True
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    facilities_used: List[Facility] = []
+    fallback: bool = False
+
+
+class ScanDeleteResponse(BaseModel):
+    deleted: int
+
+
+class StatsResponse(BaseModel):
+    total_scans: int
+    eco_points: int
+    by_category: dict
+
+
+class GateRequest(BaseModel):
+    pin: str
+
+
+class GateStatus(BaseModel):
+    unlocked: bool
+
+=== FILE: backend/pytest.ini ===
+[pytest]
+# Fixed 2 xdist workers (deterministic, not reliant on the agent passing -n). loadscope pins each test
+# class/module to one worker — generated suites share one preview backend and assume sequential shared
+# state — so it parallelizes across classes/modules without cross-test races.
+# AGENT: do NOT modify addopts; keep exactly -n 2 --dist loadscope and run only what is configured here.
+# Serial = `-n 0` (NOT `-p no:xdist`, which errors because addopts still passes -n/--dist). A custom `-n`
+# option in your own pytest setup collides with xdist's -n — rename it.
+required_plugins = pytest-xdist
+addopts = -n 2 --dist loadscope
+# asyncio_mode=auto so `async def test_...` and the conftest aclient fixture need no marker.
+asyncio_mode = auto
+
+
+=== FILE: backend/requirements.txt ===
+fastapi==0.141.1
+uvicorn==0.52.1
+boto3>=1.34.129
+requests-oauthlib>=2.0.0
+cryptography>=42.0.8
+python-dotenv>=1.0.1
+pymongo==4.18.2
+pydantic>=2.6.4
+email-validator>=2.2.0
+pyjwt>=2.10.1
+passlib>=1.7.4
+# passlib 1.7.4 needs bcrypt<4.1
+bcrypt==4.0.1
+tzdata>=2024.2
+motor==3.7.1
+pytest>=8.0.0
+pytest-xdist>=3.6.0
+pytest-asyncio>=0.24.0
+httpx>=0.27.0
+black>=24.1.1
+isort>=5.13.2
+flake8>=7.0.0
+mypy>=1.8.0
+python-jose>=3.3.0
+requests>=2.31.0
+pandas>=2.2.0
+openpyxl>=3.1.5
+numpy>=1.26.0
+python-multipart>=0.0.9
+jq>=1.6.0
+typer>=0.9.0
+google-genai==3.6.1
+
+
+=== FILE: backend/routers/__init__.py ===
+
+
+=== FILE: backend/routers/admin.py ===
+"""Admin panel API — every route here is guarded by require_admin (role read from DB).
+
+/api/me                          any signed-in person (role for the UI)
+/api/admin/stats                 dashboard numbers + charts + recent activity
+/api/admin/scans[/{id}]          all identification records, search/filter, delete
+/api/admin/users[/{id}/role]     people + role changes
+/api/admin/guidelines[/{id}]     waste categories + disposal guidelines CRUD
+/api/admin/facilities[/{id}]     facilities CRUD + activate/deactivate
+/api/admin/audit                 admin action log
+"""
+
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from lib.auth import (
+    IN_ENV, PASSCODE_LOCK, PASSCODE_MAX_FAILS, admin_email, admin_identity, audit, current_member,
+    is_admin, passcode_hash, require_admin,
+)
+from lib.db import db
+from lib.guidelines import list_guidelines
+from models.admin import (
+    ActiveIn,
+    ActivityItem,
+    AdminFacility,
+    AdminScan,
+    AdminStats,
+    AuditEntry,
+    DayCount,
+    DeleteResult,
+    FacilityIn,
+    Guideline,
+    GuidelineIn,
+    ItemCount,
+    AdminGate,
+    Me,
+    PasscodeIn,
+    ScanPage,
+    UserRow,
+    UsersResponse,
+)
+
+router = APIRouter()
+
+
+def _aware(dt):
+    if isinstance(dt, datetime) and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# ---------------------------------------------------------------- me
+@router.get("/me", response_model=Me)
+async def get_me(member: dict = Depends(current_member)):
+    role = "admin" if await is_admin(member) else "citizen"
+    return Me(user_id=member["user_id"], email=member.get("email", ""), name=member.get("name", ""), role=role)
+
+
+# ---------------------------------------------------------------- admin passcode (second lock)
+@router.get("/admin/gate", response_model=AdminGate)
+async def admin_gate(member: dict = Depends(admin_identity)):
+    attempts = await db.admin_passcode_attempts.find_one({"_id": member["user_id"]}) or {}
+    locked = _aware(attempts.get("locked_until"))
+    unlocked = bool(await db.admin_unlocks.find_one({"_id": member.get("session_id") or "", "user_id": member["user_id"]}))
+    return AdminGate(
+        admin_email=admin_email(),
+        passcode_required=bool(passcode_hash()),
+        unlocked=unlocked or not passcode_hash(),
+        locked_until=locked if locked and locked > datetime.now(timezone.utc) else None,
+    )
+
+
+@router.post("/admin/unlock", response_model=AdminGate)
+async def admin_unlock(body: PasscodeIn, member: dict = Depends(admin_identity)):
+    import hmac
+
+    now = datetime.now(timezone.utc)
+    attempts = await db.admin_passcode_attempts.find_one({"_id": member["user_id"]}) or {}
+    locked = _aware(attempts.get("locked_until"))
+    if locked and locked > now:
+        raise HTTPException(status_code=429, detail="Too many wrong attempts. Try again in 15 minutes.")
+    expected = passcode_hash()
+    if expected and not hmac.compare_digest(passcode_hash(body.passcode) or "", expected):
+        fails = attempts.get("fails", 0) + 1
+        update = {"fails": fails}
+        if fails >= PASSCODE_MAX_FAILS:
+            update = {"fails": 0, "locked_until": now + PASSCODE_LOCK}
+        await db.admin_passcode_attempts.update_one({"_id": member["user_id"]}, {"$set": update}, upsert=True)
+        left = PASSCODE_MAX_FAILS - fails
+        raise HTTPException(status_code=401, detail="Wrong passcode." + (f" {left} attempt(s) left." if left > 0 else " Locked for 15 minutes."))
+    await db.admin_passcode_attempts.delete_one({"_id": member["user_id"]})
+    await db.admin_unlocks.update_one(
+        {"_id": member.get("session_id") or ""}, {"$set": {"user_id": member["user_id"], "at": now}}, upsert=True
+    )
+    await audit(member, "admin_unlock", "admin panel unlocked")
+    return AdminGate(admin_email=admin_email(), passcode_required=bool(expected), unlocked=True, locked_until=None)
+
+
+# ---------------------------------------------------------------- dashboard
+@router.get("/admin/stats", response_model=AdminStats)
+async def admin_stats(admin: dict = Depends(require_admin)):
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(days=13)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    by_category: dict[str, int] = {}
+    async for row in db.scans.aggregate([{"$group": {"_id": "$category", "n": {"$sum": 1}}}]):
+        by_category[row["_id"] or "general"] = row["n"]
+
+    points = 0
+    async for row in db.scans.aggregate([{"$group": {"_id": None, "p": {"$sum": "$eco_points"}}}]):
+        points = row["p"]
+
+    daily_map: dict[str, int] = {}
+    async for row in db.scans.aggregate(
+        [
+            {"$match": {"created_at": {"$gte": since}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}}, "n": {"$sum": 1}}},
+        ]
+    ):
+        daily_map[row["_id"]] = row["n"]
+    daily = [
+        DayCount(date=(since + timedelta(days=i)).strftime("%Y-%m-%d"), count=daily_map.get((since + timedelta(days=i)).strftime("%Y-%m-%d"), 0))
+        for i in range(14)
+    ]
+
+    top_items = [
+        ItemCount(item_name=row["_id"], count=row["n"])
+        async for row in db.scans.aggregate(
+            [{"$group": {"_id": "$item_name", "n": {"$sum": 1}}}, {"$sort": {"n": -1}}, {"$limit": 6}]
+        )
+    ]
+
+    recent: list[ActivityItem] = []
+    emails = {u["user_id"]: u.get("email", "") async for u in db.users.find({}, {"_id": 0, "user_id": 1, "email": 1})}
+    async for s in db.scans.find({}, {"_id": 0, "item_name": 1, "category": 1, "user_id": 1, "created_at": 1}).sort("created_at", -1).limit(8):
+        who = emails.get(s.get("user_id") or "", "") or "demo (before sign-in)"
+        recent.append(ActivityItem(kind="scan", text=f"{who} scanned {s['item_name']} ({s['category']})", at=_aware(s["created_at"])))
+    async for f in db.feedback.find({}, {"_id": 0}).sort("created_at", -1).limit(5):
+        recent.append(ActivityItem(kind="feedback", text=f"{f.get('user_email', '')} sent {f['kind'].replace('_', ' ')}: {f['message'][:60]}", at=_aware(f["created_at"])))
+    async for u in db.users.find({**IN_ENV, "created_at": {"$ne": None}}, {"_id": 0}).sort("created_at", -1).limit(5):
+        recent.append(ActivityItem(kind="signup", text=f"{u.get('email', '')} joined", at=_aware(u["created_at"])))
+    recent.sort(key=lambda a: a.at, reverse=True)
+
+    return AdminStats(
+        total_users=await db.users.count_documents(IN_ENV),
+        total_scans=await db.scans.count_documents({}),
+        total_eco_points=points,
+        total_feedback=await db.feedback.count_documents({}),
+        open_feedback=await db.feedback.count_documents({"status": {"$ne": "resolved"}}),
+        active_facilities=await db.facilities.count_documents({"active": {"$ne": False}}),
+        total_facilities=await db.facilities.count_documents({}),
+        low_confidence_scans=await db.scans.count_documents({"confidence": {"$lt": 0.65}}),
+        by_category=by_category,
+        daily=daily,
+        top_items=top_items,
+        recent=recent[:12],
+    )
+
+
+# ---------------------------------------------------------------- scan records
+@router.get("/admin/scans", response_model=ScanPage)
+async def admin_scans(
+    q: str = "",
+    category: str = "",
+    user_id: str = "",
+    low_confidence: bool = False,
+    days: int = Query(default=0, ge=0, le=3650),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=200),
+    admin: dict = Depends(require_admin),
+):
+    query: dict = {}
+    if q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [{"item_name": rx}, {"subcategory": rx}, {"hint": rx}]
+    if category:
+        query["category"] = category
+    if user_id:
+        query["user_id"] = user_id
+    if low_confidence:
+        query["confidence"] = {"$lt": 0.65}
+    if days:
+        query["created_at"] = {"$gte": datetime.now(timezone.utc) - timedelta(days=days)}
+
+    total = await db.scans.count_documents(query)
+    docs = (
+        await db.scans.find(query, {"_id": 0})
+        .sort("created_at", -1)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+        .to_list(page_size)
+    )
+    ids = list({d.get("user_id") for d in docs if d.get("user_id")})
+    emails = {u["user_id"]: u.get("email", "") async for u in db.users.find({"user_id": {"$in": ids}}, {"_id": 0})}
+    items = []
+    for d in docs:
+        d["created_at"] = _aware(d["created_at"])
+        items.append(AdminScan(**d, user_email=emails.get(d.get("user_id") or "", "")))
+    return ScanPage(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.delete("/admin/scans/{scan_id}", response_model=DeleteResult)
+async def admin_delete_scan(scan_id: str, admin: dict = Depends(require_admin)):
+    doc = await db.scans.find_one({"id": scan_id}, {"_id": 0, "item_name": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Record not found")
+    res = await db.scans.delete_one({"id": scan_id})
+    await audit(admin, "delete_record", f"{doc.get('item_name', '')} ({scan_id[:8]})")
+    return DeleteResult(deleted=res.deleted_count)
+
+
+# ---------------------------------------------------------------- users
+@router.get("/admin/users", response_model=UsersResponse)
+async def admin_users(admin: dict = Depends(require_admin)):
+    people = await db.users.find(IN_ENV, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    counts = {
+        row["_id"]: row["n"]
+        async for row in db.scans.aggregate([{"$match": {"user_id": {"$ne": None}}}, {"$group": {"_id": "$user_id", "n": {"$sum": 1}}}])
+    }
+    fb_counts = {
+        row["_id"]: row["n"]
+        async for row in db.feedback.aggregate([{"$group": {"_id": "$user_id", "n": {"$sum": 1}}}])
+    }
+    rows = [
+        UserRow(
+            user_id=p["user_id"],
+            email=p.get("email", ""),
+            name=p.get("name", ""),
+            role="admin" if (p.get("email") or "").lower() == admin_email() else "citizen",
+            created_at=_aware(p.get("created_at")),
+            last_seen=_aware(p.get("last_seen")),
+            scan_count=counts.get(p["user_id"], 0),
+            feedback_count=fb_counts.get(p["user_id"], 0),
+        )
+        for p in people
+    ]
+    return UsersResponse(roles=[], users=rows)  # single admin: roles are not editable
+
+
+# ---------------------------------------------------------------- guidelines
+async def _guideline_out(doc: dict) -> Guideline:
+    return Guideline(
+        **doc,
+        facility_count=await db.facilities.count_documents({"categories": doc["key"]}),
+        scan_count=await db.scans.count_documents({"category": doc["key"]}),
+    )
+
+
+def _clean_list(items: list[str]) -> list[str]:
+    return [s.strip() for s in items if s and s.strip()]
+
+
+@router.get("/admin/guidelines", response_model=list[Guideline])
+async def admin_guidelines(admin: dict = Depends(require_admin)):
+    return [await _guideline_out(d) for d in await list_guidelines()]
+
+
+@router.post("/admin/guidelines", response_model=Guideline)
+async def admin_create_guideline(body: GuidelineIn, admin: dict = Depends(require_admin)):
+    await list_guidelines()  # make sure defaults exist first
+    if await db.guidelines.find_one({"key": body.key}):
+        raise HTTPException(status_code=409, detail="A category with this key already exists")
+    doc = {
+        **body.model_dump(),
+        "examples": _clean_list(body.examples),
+        "disposal_steps": _clean_list(body.disposal_steps),
+        "hazards": _clean_list(body.hazards),
+        "id": f"cat-{uuid.uuid4().hex[:10]}",
+        "updated_at": datetime.now(timezone.utc),
+    }
+    await db.guidelines.insert_one(dict(doc))
+    await audit(admin, "create_category", body.name)
+    return await _guideline_out(doc)
+
+
+@router.put("/admin/guidelines/{gid}", response_model=Guideline)
+async def admin_update_guideline(gid: str, body: GuidelineIn, admin: dict = Depends(require_admin)):
+    existing = await db.guidelines.find_one({"id": gid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Category not found")
+    if existing["key"] == "general" and not body.active:
+        raise HTTPException(status_code=409, detail="'general' is the fallback category and must stay active")
+    update = {
+        **body.model_dump(exclude={"key"}),  # the key is the stable id used by scans/facilities
+        "examples": _clean_list(body.examples),
+        "disposal_steps": _clean_list(body.disposal_steps),
+        "hazards": _clean_list(body.hazards),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    await db.guidelines.update_one({"id": gid}, {"$set": update})
+    await audit(admin, "update_category", body.name)
+    doc = await db.guidelines.find_one({"id": gid}, {"_id": 0})
+    return await _guideline_out(doc)
+
+
+@router.delete("/admin/guidelines/{gid}", response_model=DeleteResult)
+async def admin_delete_guideline(gid: str, admin: dict = Depends(require_admin)):
+    existing = await db.guidelines.find_one({"id": gid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Category not found")
+    if existing["key"] == "general":
+        raise HTTPException(status_code=409, detail="'general' is the fallback category and cannot be deleted")
+    res = await db.guidelines.delete_one({"id": gid})
+    await audit(admin, "delete_category", existing["name"])
+    return DeleteResult(deleted=res.deleted_count)
+
+
+# ---------------------------------------------------------------- facilities
+def _facility_out(doc: dict) -> AdminFacility:
+    return AdminFacility(
+        id=doc["id"],
+        name=doc["name"],
+        categories=doc.get("categories") or ["general"],
+        lat=doc["lat"],
+        lng=doc["lng"],
+        address=doc.get("address", ""),
+        phone=doc.get("phone"),
+        hours=doc.get("hours"),
+        accepts=doc.get("accepts", []),
+        active=doc.get("active", True) is not False,
+        source=doc.get("source", "seed"),
+        type=doc.get("type", ""),
+    )
+
+
+@router.get("/admin/facilities", response_model=list[AdminFacility])
+async def admin_facilities(q: str = "", category: str = "", status: str = "", admin: dict = Depends(require_admin)):
+    query: dict = {}
+    if q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [{"name": rx}, {"address": rx}]
+    if category:
+        query["categories"] = category
+    if status == "active":
+        query["active"] = {"$ne": False}
+    elif status == "inactive":
+        query["active"] = False
+    docs = await db.facilities.find(query, {"_id": 0}).sort("name", 1).to_list(1000)
+    return [_facility_out(d) for d in docs]
+
+
+def _facility_fields(body: FacilityIn) -> dict:
+    return {
+        **body.model_dump(),
+        "accepts": _clean_list(body.accepts),
+        "phone": (body.phone or "").strip() or None,
+        "hours": (body.hours or "").strip() or None,
+    }
+
+
+@router.post("/admin/facilities", response_model=AdminFacility)
+async def admin_create_facility(body: FacilityIn, admin: dict = Depends(require_admin)):
+    doc = {
+        **_facility_fields(body),
+        "id": f"fac-{uuid.uuid4().hex[:10]}",
+        "source": "admin",
+        "fetched_at": datetime.now(timezone.utc),
+    }
+    await db.facilities.insert_one(dict(doc))
+    await audit(admin, "create_facility", body.name)
+    return _facility_out(doc)
+
+
+@router.put("/admin/facilities/{fid}", response_model=AdminFacility)
+async def admin_update_facility(fid: str, body: FacilityIn, admin: dict = Depends(require_admin)):
+    res = await db.facilities.update_one({"id": fid}, {"$set": _facility_fields(body)})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facility not found")
+    await audit(admin, "update_facility", body.name)
+    return _facility_out(await db.facilities.find_one({"id": fid}, {"_id": 0}))
+
+
+@router.patch("/admin/facilities/{fid}/active", response_model=AdminFacility)
+async def admin_toggle_facility(fid: str, body: ActiveIn, admin: dict = Depends(require_admin)):
+    res = await db.facilities.update_one({"id": fid}, {"$set": {"active": body.active}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facility not found")
+    doc = await db.facilities.find_one({"id": fid}, {"_id": 0})
+    await audit(admin, "activate_facility" if body.active else "deactivate_facility", doc["name"])
+    return _facility_out(doc)
+
+
+@router.delete("/admin/facilities/{fid}", response_model=DeleteResult)
+async def admin_delete_facility(fid: str, admin: dict = Depends(require_admin)):
+    doc = await db.facilities.find_one({"id": fid}, {"_id": 0, "name": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Facility not found")
+    res = await db.facilities.delete_one({"id": fid})
+    await audit(admin, "delete_facility", doc["name"])
+    return DeleteResult(deleted=res.deleted_count)
+
+
+# ---------------------------------------------------------------- audit log
+@router.get("/admin/audit", response_model=list[AuditEntry])
+async def admin_audit_log(limit: int = Query(default=100, ge=1, le=500), admin: dict = Depends(require_admin)):
+    docs = await db.admin_audit.find({}, {"_id": 0}).sort("at", -1).to_list(limit)
+    return [AuditEntry(**{**d, "at": _aware(d["at"])}) for d in docs]
+
+
+=== FILE: backend/routers/chat.py ===
+"""POST /api/chat — the AI help agent: waste expert with a facility-search tool."""
+
+import json
+import logging
+
+from fastapi import APIRouter, Depends
+from google.genai import types
+
+from lib.ai import FALLBACK_REPLIES, LANGUAGE_NAMES
+from lib.db import db
+from lib.gemini import AIError, generate
+from lib.guidelines import list_guidelines
+from lib.security import rate_limit
+from models.waste import ChatRequest, ChatResponse, Facility
+from routers.facilities import find_facilities
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+MAX_TOOL_ROUNDS = 3
+
+FACILITY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_facilities",
+        "description": "Find waste disposal / recycling facilities near Chiplun, Maharashtra (e-waste centres, "
+        "recycling units, scrap dealers, municipal collection points, composting units, hazardous drop-off). "
+        "Call this whenever the user asks WHERE to dispose of something or asks for nearby centres or dealers.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Waste category of the item to dispose of.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional free text such as 'e-waste collection' or 'scrap dealer'.",
+                },
+            },
+            "required": ["category"],
+        },
+    },
+}
+
+SYSTEM_TEMPLATE = """You are "Nisarg Sahyak", the AI waste-help assistant of Swachh Chiplun — a student-built waste identification and disposal assistant for Chiplun, Ratnagiri district, Maharashtra, India. You answer questions on waste segregation, recycling methods, e-waste laws, composting, reuse ideas and environmental impact.
+
+Knowledge to ground answers in:
+- Solid Waste Management Rules 2016: segregate at source into wet/biodegradable, dry/recyclable, and domestic hazardous waste.
+- E-Waste (Management) Rules 2022: electronics and batteries go ONLY to authorised recyclers, producers' collection points or registered scrap dealers — never into regular bins or to informal burning.
+- Bio-Medical Waste Management Rules 2016: masks, syringes, sanitary waste follow the yellow/red stream via authorised handlers.
+- Local context: Chiplun town, Khed, Lote Parshuram MIDC and Ratnagiri district; the partner organisation is Sahyadri Nisarg Mitra, an environmental NGO.
+
+SAFETY GUARDRAILS (must follow):
+1. For hazardous or biomedical items, START the answer with a clear safety warning.
+2. NEVER advise open burning, open dumping, burying chemicals, or draining liquids into soil or water bodies.
+3. NEVER give medical diagnosis or medicine dosage — redirect to a doctor or the Sub-District Hospital, Chiplun.
+4. Broken glass, tube-lights or batteries: give careful handling steps (seal in a container, keep away from children).
+
+Style: warm, practical, concise (max ~180 words), short bullets where helpful. If you used search_facilities, name the best facility from the results and tell the user to open the Facilities page for distance and directions. If the question has nothing to do with waste or environment, answer briefly and steer back to waste topics.
+
+IMPORTANT: write your reply in {language}."""
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_with_agent(input: ChatRequest, member: dict = Depends(rate_limit("chat", 20))):
+    guidelines = await list_guidelines(active_only=True)
+    local_rules = "\n".join(
+        f"- {g['key']} ({g['name']}): {g.get('description', '')} Steps: {' | '.join(g.get('disposal_steps', []))}"
+        for g in guidelines
+    )
+    system = SYSTEM_TEMPLATE.format(language=LANGUAGE_NAMES[input.language]) + (
+        "\n\nOfficial Chiplun waste categories and disposal guidelines (set by the town admin — prefer these):\n"
+        + local_rules
+    )
+    tips = await db.tips.find({"active": {"$ne": False}}, {"_id": 0, "title": 1, "body": 1}).sort("updated_at", -1).to_list(20)
+    if tips:
+        system += "\n\nKnowledge tips written by the Chiplun admin (use when relevant):\n" + "\n".join(
+            f"- {t['title']}: {t['body']}" for t in tips
+        )
+
+    tool = types.Tool(function_declarations=[types.FunctionDeclaration(
+        name=FACILITY_TOOL["function"]["name"],
+        description=FACILITY_TOOL["function"]["description"],
+        parameters_json_schema={
+            **FACILITY_TOOL["function"]["parameters"],
+            "properties": {
+                **FACILITY_TOOL["function"]["parameters"]["properties"],
+                "category": {
+                    "type": "string",
+                    "enum": [g["key"] for g in guidelines] or ["general"],  # the admin's category list
+                    "description": "Waste category key of the item to dispose of.",
+                },
+            },
+        },
+    )])
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=0.4,
+        tools=[tool],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+    parts = []
+    history_lines = [
+        f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}" for m in input.history[-8:]
+    ]
+    if history_lines:
+        parts.append("Conversation so far:\n" + "\n".join(history_lines))
+    if input.scan_context:
+        parts.append(
+            f"Context: the user recently scanned an item '{input.scan_context.item_name}' "
+            f"(category: {input.scan_context.category}). Use this as context if relevant."
+        )
+    parts.append(f"User's new question: {input.message}")
+
+    contents: list = [types.Content(role="user", parts=[types.Part.from_text(text="\n\n".join(parts))])]
+    facilities_used: list[Facility] = []
+    try:
+        response = await generate(contents, config)
+        rounds = 0
+        while response.function_calls and rounds < MAX_TOOL_ROUNDS:
+            contents.append(response.candidates[0].content)
+            replies = []
+            for call in response.function_calls:
+                if call.name == "search_facilities":
+                    args = call.args or {}
+                    results = await find_facilities(category=args.get("category"), live=False)
+                    facilities_used.extend(Facility(**doc) for doc in results[:5])
+                    payload = {"result": json.loads(json.dumps(results[:5], default=str))}
+                else:
+                    payload = {"error": f"unknown tool {call.name}"}
+                replies.append(types.Part.from_function_response(name=call.name, response=payload))
+            contents.append(types.Content(role="user", parts=replies))  # Gemini: function responses go in a user turn
+            response = await generate(contents, config)
+            rounds += 1
+        reply = (response.text or "").strip()
+        if not reply:
+            raise AIError("error")
+        return ChatResponse(reply=reply, facilities_used=facilities_used[:5], fallback=False)
+    except AIError as exc:
+        prefix = "" if exc.kind == "error" else exc.message + "\n\n"
+        return ChatResponse(reply=prefix + FALLBACK_REPLIES[input.language], facilities_used=[], fallback=True)
+    except Exception:
+        logger.exception("chat failed")
+        return ChatResponse(reply=FALLBACK_REPLIES[input.language], facilities_used=[], fallback=True)
+
+=== FILE: backend/routers/classify.py ===
+"""POST /api/classify — vision-LLM waste identification (image and/or text hint)."""
+
+import base64
+import binascii
+import json
+import logging
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+from google.genai import types
+
+from lib.ai import LANGUAGE_NAMES
+from lib.db import db
+from lib.gemini import FRIENDLY, AIError, generate
+from lib.guidelines import list_guidelines
+from lib.security import rate_limit
+from models.waste import Classification, ClassificationRequest
+
+ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
+
+
+def response_schema(categories: list[str]) -> dict:
+    """Same JSON keys the app always used — now enforced by Gemini structured output."""
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "item_name": {"type": "STRING"},
+            "category": {"type": "STRING", "enum": categories},
+            "subcategory": {"type": "STRING"},
+            "confidence": {"type": "NUMBER"},
+            "disposal_steps": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "hazards": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "eco_tip": {"type": "STRING"},
+            "needs_follow_up": {"type": "BOOLEAN"},
+            "follow_up_question": {"type": "STRING"},
+            "follow_up_options": {"type": "ARRAY", "items": {"type": "STRING"}},
+        },
+        "required": ["item_name", "category", "confidence", "disposal_steps", "hazards", "needs_follow_up"],
+    }
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+CATEGORIES = ["ewaste", "recyclable", "general", "organic", "hazardous", "biomedical"]
+ECO_POINTS = {"ewaste": 25, "biomedical": 20, "hazardous": 20, "organic": 15, "recyclable": 10, "general": 5}
+
+SYSTEM_TEMPLATE = """You are the classification engine of "Swachh Chiplun", an AI waste identification and disposal assistant for Chiplun, Ratnagiri district, Maharashtra, India. You identify ONE waste item from the attached photo and/or the user's description, classify it, and explain disposal according to Indian rules.
+
+Reply with ONLY a JSON object — no markdown fences, no commentary — with exactly these keys:
+{{"item_name": string, "category": one of {cats}, "subcategory": string, "confidence": number between 0 and 1, "disposal_steps": string array of 3 to 6 steps, "hazards": string array, "eco_tip": string, "needs_follow_up": boolean, "follow_up_question": string, "follow_up_options": string array of at most 3}}
+
+Classification guide (managed by the Chiplun admin — follow it):
+<<GUIDE>>
+
+Rules:
+1. confidence is your honest certainty (0-1). If confidence < 0.65, or the image is blurry/unclear, or the description is ambiguous, set needs_follow_up=true and ask ONE short question in follow_up_question with up to 3 short answer options in follow_up_options.
+2. disposal_steps must follow Indian practice: segregate at source, use authorised channels, never open-burn or open-dump. For hazardous or biomedical items, step 1 must be a safety precaution.
+3. hazards lists concrete dangers (e.g. "Mercury vapour if tube glass breaks", "Lithium fire risk if battery is punctured"); empty array when none.
+4. If the user's description contains "Barcode:" followed by digits, treat it as the product's barcode and identify the product from it.
+5. Write item_name and subcategory in English (item_name may add the local name in brackets). Write disposal_steps, hazards, eco_tip, follow_up_question and follow_up_options in {language}.
+6. If you truly cannot tell what the item is, set needs_follow_up=true, item_name to your best short guess, and confidence to your honest low value."""
+
+
+def extract_json(text: str) -> dict:
+    t = text.strip()
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError(f"no JSON object in model reply: {text[:200]!r}")
+    return json.loads(t[start : end + 1])
+
+
+def guide_text(guidelines: list[dict]) -> str:
+    lines = []
+    for g in guidelines:
+        line = f"- {g['key']} ({g['name']}): {g.get('description', '')}"
+        if g.get("examples"):
+            line += f" Examples: {', '.join(g['examples'])}."
+        if g.get("disposal_steps"):
+            line += f" Official local disposal steps: {' | '.join(g['disposal_steps'])}."
+        if g.get("hazards"):
+            line += f" Known hazards: {' | '.join(g['hazards'])}."
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@router.post("/classify", response_model=Classification)
+async def classify_item(input: ClassificationRequest, member: dict = Depends(rate_limit("classify", 15))):
+    if not input.image_base64 and not (input.hint and input.hint.strip()):
+        raise HTTPException(status_code=422, detail="Provide an image or a text hint describing the waste item.")
+    if input.image_base64 and len(input.image_base64) > 9_000_000:
+        raise HTTPException(status_code=413, detail="Image too large — retake or upload a smaller photo.")
+
+    guidelines = await list_guidelines(active_only=True)
+    by_key = {g["key"]: g for g in guidelines}
+    categories = list(by_key) or CATEGORIES
+    system = SYSTEM_TEMPLATE.format(
+        cats=", ".join(categories), language=LANGUAGE_NAMES[input.language]
+    ).replace("<<GUIDE>>", guide_text(guidelines))
+
+    desc = []
+    if input.hint and input.hint.strip():
+        desc.append(f"User's description / hint: {input.hint.strip()}")
+    if input.image_base64:
+        desc.append("Identify the single waste item shown in the attached photo.")
+    text = "\n".join(desc)
+
+    contents: list = [types.Part.from_text(text=text)]
+    if input.image_base64:
+        if input.mime_type not in ALLOWED_MIME:
+            raise HTTPException(status_code=415, detail="Only JPEG, PNG or WEBP photos are accepted.")
+        try:
+            image_bytes = base64.b64decode(input.image_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=422, detail="The photo could not be read — please retake it.")
+        contents.insert(0, types.Part.from_bytes(data=image_bytes, mime_type=input.mime_type))
+
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=0.2,
+        response_mime_type="application/json",
+        response_schema=response_schema(categories),
+    )
+    data = None
+    try:
+        for _attempt in range(2):  # validate every result; retry once if invalid
+            reply = await generate(contents, config)
+            try:
+                candidate = extract_json(reply.text or "")
+                if candidate.get("category") in categories and 0 <= float(candidate.get("confidence")) <= 1:
+                    data = candidate
+                    break
+            except (ValueError, TypeError):
+                pass
+            logger.warning("classify: invalid AI result, retrying once")
+    except AIError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from None
+    if data is None:
+        raise HTTPException(status_code=422, detail=FRIENDLY["invalid"])
+
+    category = data.get("category", "general")
+    if category not in categories:
+        category = "general"
+    guideline = by_key.get(category, {})
+    try:
+        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    result = Classification(
+        item_name=str(data.get("item_name", "Unknown item"))[:120],
+        category=category,
+        subcategory=str(data.get("subcategory", ""))[:120],
+        confidence=confidence,
+        disposal_steps=[str(s) for s in (data.get("disposal_steps") or [])][:8],
+        hazards=[str(s) for s in (data.get("hazards") or [])][:6],
+        eco_tip=str(data.get("eco_tip", "")),
+        eco_points=int(guideline.get("eco_points", ECO_POINTS.get(category, 5))),
+        needs_follow_up=bool(data.get("needs_follow_up", False)) and confidence < 0.8,
+        follow_up_question=str(data.get("follow_up_question", "")),
+        follow_up_options=[str(s) for s in (data.get("follow_up_options") or [])][:3],
+        language=input.language,
+        hint=input.hint,
+        created_at=datetime.now(timezone.utc),
+        category_label=str(guideline.get("name", "")),
+        user_id=member["user_id"],
+    )
+
+    await db.scans.insert_one({"_id": result.id, **result.model_dump()})
+    return result
+
+=== FILE: backend/routers/doorstep.py ===
+"""Doorstep Garbage Vehicle — DEMO ONLY.
+
+User side (any signed-in member, existing login):
+  GET/PUT/DELETE /api/pickup/spot       saved pickup pin
+  POST/DELETE    /api/pickup/request    "I have waste today" / cancel
+  GET            /api/pickup/live       polled every 4 s: vehicle, ETA, status, last 30 alerts
+Admin side (existing require_admin):
+  /api/admin/doorstep/routes[...]       route tool + sample route
+  /api/admin/doorstep/demo-users[...]   demo residents (no login, never in db.users)
+  /api/admin/doorstep/state|trip/*      simulated vehicle control, live map, driver view
+  /api/admin/demo-data[/clear]          danger zone (demo users + demo trips only)
+Demo data lives in its own collections, so the real dashboards never count it.
+"""
+
+import math
+import random
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from lib.auth import audit, current_member, require_admin
+from lib.db import db
+from lib import doorstep as sim
+from models.doorstep import (
+    AdminDoorstepState,
+    ClearDemoIn,
+    DemoDataCounts,
+    DemoUser,
+    DemoUserIn,
+    GenerateIn,
+    LatLng,
+    OkResponse,
+    Pin,
+    PinKeyIn,
+    PickupAlert,
+    PickupLive,
+    PickupRequestIn,
+    Route,
+    RouteIn,
+    RouteView,
+    SpeedIn,
+    Spot,
+    SpotIn,
+    TripStartIn,
+    TripSummary,
+    VehicleView,
+    FeedItem,
+)
+
+router = APIRouter()
+
+CATEGORY_KEYS = ["ewaste", "recyclable", "general", "organic", "hazardous", "biomedical"]
+
+
+def _clean_types(types: list[str]) -> list[str]:
+    out = [t for t in dict.fromkeys(types) if t in CATEGORY_KEYS]
+    if not out:
+        raise HTTPException(status_code=422, detail="Choose at least one waste type")
+    return out
+
+
+async def _route_doc(route_id: str) -> dict:
+    doc = await db.demo_routes.find_one({"id": route_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Route not found")
+    return doc
+
+
+def _vehicle_view(trip: dict) -> VehicleView:
+    pos = sim.vehicle_pos(trip)
+    return VehicleView(
+        lat=pos["lat"],
+        lng=pos["lng"],
+        state=trip["state"],
+        mode=trip.get("mode", "auto"),
+        speed=int(trip.get("speed", 1)),
+        path=[LatLng(**p) for p in trip["path"]],
+    )
+
+
+# ================================================================ user side
+@router.get("/pickup/spot", response_model=Spot | None)
+async def get_spot(member: dict = Depends(current_member)):
+    return await db.pickup_spots.find_one({"user_id": member["user_id"]}, {"_id": 0, "user_id": 0, "id": 0})
+
+
+@router.put("/pickup/spot", response_model=Spot)
+async def save_spot(body: SpotIn, member: dict = Depends(current_member)):
+    await db.pickup_spots.update_one(
+        {"user_id": member["user_id"]},
+        {
+            "$set": {**body.model_dump(), "label": body.label.strip() or "My pickup spot", "updated_at": sim.now()},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "user_id": member["user_id"], "request": None},
+        },
+        upsert=True,
+    )
+    return await db.pickup_spots.find_one({"user_id": member["user_id"]}, {"_id": 0, "user_id": 0, "id": 0})
+
+
+@router.delete("/pickup/spot", response_model=OkResponse)
+async def delete_spot(member: dict = Depends(current_member)):
+    await db.pickup_spots.delete_one({"user_id": member["user_id"]})
+    return OkResponse()
+
+
+@router.post("/pickup/request", response_model=Spot)
+async def request_pickup(body: PickupRequestIn, member: dict = Depends(current_member)):
+    req = {
+        "waste_types": _clean_types(body.waste_types),
+        "note": body.note.strip(),
+        "status": "requested",
+        "created_at": sim.iso(sim.now()),
+    }
+    res = await db.pickup_spots.update_one({"user_id": member["user_id"]}, {"$set": {"request": req}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=409, detail="Save your pickup spot on the map first")
+    # a new request during a running trip may be collected on this trip
+    trip = await sim.active_trip()
+    if trip and trip.get("state") in ("running", "paused"):
+        await db.demo_trips.update_one(
+            {"id": trip["id"]}, {"$unset": {f"pins.real_{member['user_id']}.collected_at": ""}}
+        )
+    return await db.pickup_spots.find_one({"user_id": member["user_id"]}, {"_id": 0, "user_id": 0, "id": 0})
+
+
+@router.delete("/pickup/request", response_model=OkResponse)
+async def cancel_request(member: dict = Depends(current_member)):
+    await db.pickup_spots.update_one({"user_id": member["user_id"]}, {"$set": {"request": None}})
+    return OkResponse()
+
+
+@router.get("/pickup/live", response_model=PickupLive)
+async def pickup_live(member: dict = Depends(current_member)):
+    trip = await sim.advance(await sim.active_trip())
+    spot = await db.pickup_spots.find_one({"user_id": member["user_id"]}, {"_id": 0, "user_id": 0, "id": 0})
+    route_doc = None
+    if trip:
+        route_doc = await db.demo_routes.find_one({"id": trip["route_id"]}, {"_id": 0})
+    if not route_doc:
+        route_doc = await db.demo_routes.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+    live = PickupLive(
+        route=RouteView(**route_doc) if route_doc else None,
+        spot=Spot(**spot) if spot else None,
+        alerts=[
+            PickupAlert(**{**a, "at": sim.iso(a["at"])})
+            async for a in db.pickup_alerts.find({"user_id": member["user_id"]}, {"_id": 0}).sort("at", -1).limit(30)
+        ],
+    )
+    show_vehicle = trip and trip.get("state") in ("running", "paused")
+    if show_vehicle:
+        live.vehicle = _vehicle_view(trip)
+    if spot:
+        req = spot.get("request") or {}
+        live.status = req.get("status") or "waiting"
+        if show_vehicle:
+            d = sim.dist_m(sim.vehicle_pos(trip), spot)
+            live.distance_m = int(round(d))
+            live.eta_min = sim.eta_minutes(d, trip)
+    return live
+
+
+# ================================================================ admin: routes
+async def _route_out(doc: dict) -> Route:
+    name = ""
+    if doc.get("facility_id"):
+        f = await db.facilities.find_one({"id": doc["facility_id"]}, {"_id": 0, "name": 1})
+        name = (f or {}).get("name", "")
+    return Route(**{**doc, "facility_name": name})
+
+
+@router.get("/admin/doorstep/routes", response_model=list[Route])
+async def list_routes(admin: dict = Depends(require_admin)):
+    return [await _route_out(d) async for d in db.demo_routes.find({}, {"_id": 0}).sort("created_at", -1)]
+
+
+@router.post("/admin/doorstep/routes", response_model=Route)
+async def create_route(body: RouteIn, admin: dict = Depends(require_admin)):
+    doc = {**body.model_dump(), "id": str(uuid.uuid4()), "is_demo": False, "created_at": sim.now()}
+    await db.demo_routes.insert_one(dict(doc))
+    await audit(admin, "doorstep.route.create", body.name)
+    return await _route_out(doc)
+
+
+@router.put("/admin/doorstep/routes/{route_id}", response_model=Route)
+async def update_route(route_id: str, body: RouteIn, admin: dict = Depends(require_admin)):
+    await _route_doc(route_id)
+    await db.demo_routes.update_one({"id": route_id}, {"$set": body.model_dump()})
+    await audit(admin, "doorstep.route.update", body.name)
+    return await _route_out(await _route_doc(route_id))
+
+
+@router.delete("/admin/doorstep/routes/{route_id}", response_model=OkResponse)
+async def delete_route(route_id: str, admin: dict = Depends(require_admin)):
+    doc = await _route_doc(route_id)
+    await db.demo_routes.delete_one({"id": route_id})
+    await audit(admin, "doorstep.route.delete", doc["name"])
+    return OkResponse()
+
+
+SAMPLE_POINTS = [
+    (17.5378, 73.5118),  # start: Markandi
+    (17.5352, 73.5146),
+    (17.5323, 73.5186),  # Chiplun market
+    (17.5301, 73.5214),
+    (17.5272, 73.5241),
+    (17.5241, 73.5262),  # Bahadur Shaikh Naka
+    (17.5206, 73.5291),  # end
+]
+
+
+@router.post("/admin/doorstep/routes/sample", response_model=Route)
+async def sample_route(admin: dict = Depends(require_admin)):
+    pts = [{"lat": a, "lng": b} for a, b in SAMPLE_POINTS]
+    end = pts[-1]
+    facility_id = None
+    best = None
+    async for f in db.facilities.find({"active": {"$ne": False}, "source": {"$ne": "osm"}}, {"_id": 0}):
+        d = sim.dist_m(end, f)
+        if best is None or d < best:
+            best, facility_id = d, f["id"]
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": "Demo — Markandi to Bahadur Shaikh Naka",
+        "points": pts,
+        "time_window": "07:00 – 09:00",
+        "facility_id": facility_id,
+        "is_demo": True,
+        "created_at": sim.now(),
+    }
+    await db.demo_routes.insert_one(dict(doc))
+    await audit(admin, "doorstep.route.sample", doc["name"])
+    return await _route_out(doc)
+
+
+# ================================================================ admin: demo users
+def _demo_out(d: dict) -> DemoUser:
+    return DemoUser(**d)
+
+
+@router.get("/admin/doorstep/demo-users", response_model=list[DemoUser])
+async def list_demo_users(admin: dict = Depends(require_admin)):
+    return [_demo_out(d) async for d in db.demo_users.find({}, {"_id": 0}).sort("created_at", 1)]
+
+
+async def _next_demo_number() -> int:
+    n = 0
+    async for d in db.demo_users.find({}, {"_id": 0, "number": 1}):
+        n = max(n, int(d.get("number", 0)))
+    return n + 1
+
+
+@router.post("/admin/doorstep/demo-users", response_model=DemoUser)
+async def add_demo_user(body: DemoUserIn, admin: dict = Depends(require_admin)):
+    n = await _next_demo_number()
+    doc = {
+        **body.model_dump(),
+        "waste_types": [t for t in body.waste_types if t in CATEGORY_KEYS] or ["general"],
+        "name": body.name.strip() or f"Demo User {n}",
+        "label": body.label.strip() or f"House {n}",
+        "number": n,
+        "id": str(uuid.uuid4()),
+        "is_demo": True,
+        "created_at": sim.now(),
+    }
+    await db.demo_users.insert_one(dict(doc))
+    return _demo_out(doc)
+
+
+@router.put("/admin/doorstep/demo-users/{demo_id}", response_model=DemoUser)
+async def update_demo_user(demo_id: str, body: DemoUserIn, admin: dict = Depends(require_admin)):
+    doc = await db.demo_users.find_one({"id": demo_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Demo user not found")
+    upd = body.model_dump()
+    upd["name"] = body.name.strip() or doc["name"]
+    upd["label"] = body.label.strip() or doc.get("label", "")
+    upd["waste_types"] = [t for t in body.waste_types if t in CATEGORY_KEYS] or doc.get("waste_types", ["general"])
+    await db.demo_users.update_one({"id": demo_id}, {"$set": upd})
+    return _demo_out({**doc, **upd})
+
+
+@router.delete("/admin/doorstep/demo-users/{demo_id}", response_model=OkResponse)
+async def delete_demo_user(demo_id: str, admin: dict = Depends(require_admin)):
+    await db.demo_users.delete_one({"id": demo_id, "is_demo": True})
+    return OkResponse()
+
+
+@router.post("/admin/doorstep/demo-users/generate", response_model=list[DemoUser])
+async def generate_demo_users(body: GenerateIn, admin: dict = Depends(require_admin)):
+    route = await _route_doc(body.route_id)
+    pts = route["points"]
+    cum = sim.cumulative(pts)
+    rnd = random.Random()
+    n = await _next_demo_number()
+    alerts = [300, 500, 1000]
+    blocks = ["Sai Apartment", "Ganesh Niwas", "Shivaji Chawl", "Om Residency", "Laxmi Building", "Krishna Society"]
+    docs = []
+    for i in range(body.count):
+        # spread evenly along the route (near the stops), 25–110 m to the side
+        d = cum[-1] * (i + 0.5) / body.count
+        p = sim.point_at(pts, cum, d)
+        off_m = rnd.uniform(25, 110) * rnd.choice([-1, 1])
+        ang = rnd.uniform(0, 3.14159 * 2)
+        p = {
+            "lat": p["lat"] + (off_m * math.sin(ang)) / 111_320,
+            "lng": p["lng"] + (off_m * math.cos(ang)) / (111_320 * 0.954),
+        }
+        num = n + i
+        docs.append(
+            {
+                "id": str(uuid.uuid4()),
+                "number": num,
+                "name": f"Demo User {num}",
+                "label": f"{blocks[i % len(blocks)]}, flat {rnd.randint(1, 12)}",
+                "lat": round(p["lat"], 6),
+                "lng": round(p["lng"], 6),
+                "alert_m": alerts[i % 3],
+                "waste_types": rnd.sample(CATEGORY_KEYS, rnd.choice([1, 1, 2, 3])),
+                "has_waste": i % 6 != 5,  # a few residents have nothing today
+                "is_demo": True,
+                "created_at": sim.now(),
+            }
+        )
+    if docs:
+        await db.demo_users.insert_many([dict(d) for d in docs])
+    await audit(admin, "doorstep.demo_users.generate", f"{len(docs)} along {route['name']}")
+    return [_demo_out(d) for d in docs]
+
+
+# ================================================================ admin: simulation
+async def _require_trip(active_only: bool = True) -> dict:
+    trip = await sim.active_trip()
+    if not trip or (active_only and trip.get("state") not in ("running", "paused")):
+        raise HTTPException(status_code=409, detail="No demo trip is running. Press Start first.")
+    return trip
+
+
+def _pin_out(p: dict, trip: dict | None, pos: dict | None) -> Pin:
+    d = sim.dist_m(pos, p) if pos else None
+    return Pin(
+        key=p["key"],
+        kind=p["kind"],
+        name=p["name"],
+        label=p["label"],
+        lat=p["lat"],
+        lng=p["lng"],
+        alert_m=p["alert_m"],
+        waste_types=p["waste_types"],
+        status=sim.pin_status(p, trip),
+        distance_m=int(round(d)) if d is not None else None,
+        eta_min=sim.eta_minutes(d, trip) if (d is not None and trip) else None,
+    )
+
+
+@router.get("/admin/doorstep/state", response_model=AdminDoorstepState)
+async def admin_state(admin: dict = Depends(require_admin)):
+    trip = await sim.advance(await sim.active_trip())
+    live = bool(trip and trip.get("state") in ("running", "paused"))
+    pos = sim.vehicle_pos(trip) if live else None
+    raw = await sim.all_pins()
+    pins = [_pin_out(p, trip, pos) for p in raw]  # finished trip keeps its final statuses
+    out = AdminDoorstepState(pins=pins)
+    if trip:
+        out.trip_id = trip["id"]
+        out.route_id = trip["route_id"]
+        out.feed = [FeedItem(**f) for f in reversed(trip.get("feed", []))]
+        if trip.get("summary") and trip["state"] in ("finished", "stopped"):
+            out.summary = TripSummary(**trip["summary"])
+    if live:
+        out.vehicle = _vehicle_view(trip)
+        total = trip["cum"][-1] or 1
+        done, _ = sim.project(trip["path"], trip["cum"], pos)
+        out.progress_pct = int(min(100, done / total * 100))
+        ahead = []
+        for p, view in zip(raw, pins):
+            if view.status in ("requested", "near") and p.get("has_waste"):
+                along, off = sim.project(trip["path"], trip["cum"], p)
+                if off <= sim.ON_ROUTE_M and along >= done - 30:
+                    ahead.append((along, view))
+        out.next_stops = [v for _, v in sorted(ahead, key=lambda x: x[0])][:8]
+    return out
+
+
+@router.post("/admin/doorstep/trip/start", response_model=OkResponse)
+async def start_trip(body: TripStartIn, admin: dict = Depends(require_admin)):
+    route = await _route_doc(body.route_id)
+    old = await sim.active_trip()
+    if old and old.get("state") in ("running", "paused"):
+        await sim.finish_trip(old, "stopped")
+    path = route["points"]
+    if body.start:
+        path = [body.start.model_dump()] + path
+    facility_name = (await _route_out(route)).facility_name
+    trip = {
+        "id": str(uuid.uuid4()),
+        "route_id": route["id"],
+        "route_name": route["name"],
+        "facility_name": facility_name,
+        "path": path,
+        "cum": sim.cumulative(path),
+        "speed": body.speed,
+        "state": "running",
+        "mode": "auto",
+        "elapsed_s": 0.0,
+        "resumed_at": sim.now(),
+        "manual_pos": None,
+        "pins": {},
+        "feed": [{"text": f"Trip started on {route['name']} at {body.speed}x speed", "at": sim.iso(sim.now())}],
+        "is_demo": True,
+        "created_at": sim.now(),
+    }
+    await db.demo_trips.insert_one(dict(trip))
+    # real requests left at "near" from an earlier trip wait again
+    await db.pickup_spots.update_many({"request.status": "near"}, {"$set": {"request.status": "requested"}})
+    await audit(admin, "doorstep.trip.start", route["name"])
+    return OkResponse()
+
+
+def _freeze(trip: dict) -> float:
+    return sim.progress_m(trip) / sim.speed_ms(trip)
+
+
+@router.post("/admin/doorstep/trip/pause", response_model=OkResponse)
+async def pause_trip(admin: dict = Depends(require_admin)):
+    trip = await _require_trip()
+    if trip["state"] == "running":
+        await db.demo_trips.update_one(
+            {"id": trip["id"]}, {"$set": {"state": "paused", "elapsed_s": _freeze(trip), "resumed_at": None}}
+        )
+        await sim.push_feed(trip["id"], "Vehicle paused")
+    return OkResponse()
+
+
+@router.post("/admin/doorstep/trip/resume", response_model=OkResponse)
+async def resume_trip(admin: dict = Depends(require_admin)):
+    trip = await _require_trip()
+    elapsed = _freeze(trip)
+    if trip.get("mode") == "manual" and trip.get("manual_pos"):
+        along, _ = sim.project(trip["path"], trip["cum"], trip["manual_pos"])
+        elapsed = along / sim.speed_ms(trip)
+    await db.demo_trips.update_one(
+        {"id": trip["id"]},
+        {"$set": {"state": "running", "mode": "auto", "manual_pos": None, "elapsed_s": elapsed, "resumed_at": sim.now()}},
+    )
+    await sim.push_feed(trip["id"], "Vehicle resumed (auto mode)")
+    return OkResponse()
+
+
+@router.post("/admin/doorstep/trip/stop", response_model=OkResponse)
+async def stop_trip(admin: dict = Depends(require_admin)):
+    trip = await _require_trip()
+    await sim.finish_trip(trip, "stopped")
+    await audit(admin, "doorstep.trip.stop", trip.get("route_name", ""))
+    return OkResponse()
+
+
+@router.put("/admin/doorstep/trip/speed", response_model=OkResponse)
+async def set_speed(body: SpeedIn, admin: dict = Depends(require_admin)):
+    trip = await _require_trip()
+    travelled = sim.progress_m(trip)
+    upd = {"speed": body.speed, "elapsed_s": travelled / (sim.BASE_SPEED_MS * body.speed)}
+    if trip["state"] == "running" and trip.get("mode") == "auto":
+        upd["resumed_at"] = sim.now()
+    await db.demo_trips.update_one({"id": trip["id"]}, {"$set": upd})
+    await sim.push_feed(trip["id"], f"Speed changed to {body.speed}x")
+    return OkResponse()
+
+
+@router.put("/admin/doorstep/trip/position", response_model=OkResponse)
+async def manual_position(body: LatLng, admin: dict = Depends(require_admin)):
+    """Manual mode: the admin drags the vehicle marker."""
+    trip = await _require_trip()
+    first = trip.get("mode") != "manual"
+    await db.demo_trips.update_one(
+        {"id": trip["id"]},
+        {"$set": {"mode": "manual", "manual_pos": body.model_dump(), "elapsed_s": _freeze(trip), "resumed_at": None}},
+    )
+    if first:
+        await sim.push_feed(trip["id"], "Manual mode: vehicle moved by admin")
+    await sim.advance(await sim.active_trip())
+    return OkResponse()
+
+
+@router.post("/admin/doorstep/trip/place-near", response_model=OkResponse)
+async def place_near(body: PinKeyIn, admin: dict = Depends(require_admin)):
+    trip = await _require_trip()
+    pin = next((p for p in await sim.all_pins() if p["key"] == body.pin_key), None)
+    if not pin:
+        raise HTTPException(status_code=404, detail="User not found")
+    along, off = sim.project(trip["path"], trip["cum"], pin)
+    if off <= sim.ON_ROUTE_M and along > 0:
+        # jump along the route to ~400 m before the user, keep driving automatically
+        target = max(0.0, along - 400)
+        upd = {"mode": "auto", "manual_pos": None, "elapsed_s": target / sim.speed_ms(trip)}
+        if trip["state"] == "running":
+            upd["resumed_at"] = sim.now()
+    else:
+        # user is far from the route: park the vehicle ~400 m north of them (manual mode)
+        upd = {
+            "mode": "manual",
+            "manual_pos": {"lat": pin["lat"] + 400 / 111_320, "lng": pin["lng"]},
+            "elapsed_s": _freeze(trip),
+            "resumed_at": None,
+        }
+    await db.demo_trips.update_one({"id": trip["id"]}, {"$set": upd})
+    await sim.push_feed(trip["id"], f"Vehicle placed about 400 m from {pin['name']}")
+    await sim.advance(await sim.active_trip())
+    return OkResponse()
+
+
+@router.post("/admin/doorstep/trip/collect", response_model=OkResponse)
+async def driver_collect(body: PinKeyIn, admin: dict = Depends(require_admin)):
+    trip = await _require_trip()
+    pin = next((p for p in await sim.all_pins() if p["key"] == body.pin_key), None)
+    if not pin:
+        raise HTTPException(status_code=404, detail="User not found")
+    await sim.mark_collected(trip, pin, by="driver")
+    return OkResponse()
+
+
+# ================================================================ admin: danger zone
+@router.get("/admin/demo-data", response_model=DemoDataCounts)
+async def demo_data_counts(admin: dict = Depends(require_admin)):
+    return DemoDataCounts(
+        demo_users=await db.demo_users.count_documents({"is_demo": True}),
+        demo_trips=await db.demo_trips.count_documents({"is_demo": True}),
+    )
+
+
+@router.post("/admin/demo-data/clear", response_model=DemoDataCounts)
+async def clear_demo_data(body: ClearDemoIn, admin: dict = Depends(require_admin)):
+    if body.phrase.strip() != "CLEAR DEMO" or not body.confirm:
+        raise HTTPException(status_code=422, detail='Type CLEAR DEMO exactly and tick the confirmation')
+    users = await db.demo_users.delete_many({"is_demo": True})
+    trips = await db.demo_trips.delete_many({"is_demo": True})
+    await audit(admin, "demo_data.clear", f"{users.deleted_count} demo users, {trips.deleted_count} demo trips")
+    return DemoDataCounts(demo_users=users.deleted_count, demo_trips=trips.deleted_count)
+
+
+=== FILE: backend/routers/facilities.py ===
+"""GET /api/facilities — category-based facility finder (curated Chiplun seed + live OpenStreetMap)."""
+
+import logging
+import math
+from datetime import datetime, timedelta, timezone
+
+import httpx
+from fastapi import APIRouter, Depends
+
+from lib.auth import current_member
+from lib.db import db
+from models.waste import Facility
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+CHIPLUN_LAT = 17.5323
+CHIPLUN_LNG = 73.5186
+SEARCH_RADIUS_M = 25_000
+CACHE_TTL = timedelta(hours=24)
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_QUERY = """[out:json][timeout:15];
+(
+  node["amenity"="recycling"](around:{radius},{lat},{lng});
+  way["amenity"="recycling"](around:{radius},{lat},{lng});
+  node["shop"="second_hand"](around:{radius},{lat},{lng});
+  node["name"~"scrap|kabadi|kabaadi|recycl|e-?waste",i](around:{radius},{lat},{lng});
+);
+out center tags 40;"""
+
+
+def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def osm_categories(tags: dict, name: str) -> list[str]:
+    cats: list[str] = []
+    blob = " ".join(str(v) for v in tags.values()).lower() + " " + name.lower()
+    if (
+        tags.get("recycling:e_waste") == "yes"
+        or tags.get("recycling:electronics") == "yes"
+        or tags.get("recycling:batteries") == "yes"
+        or "e-waste" in blob
+        or "ewaste" in blob
+    ):
+        cats.append("ewaste")
+    if tags.get("shop") == "second_hand" or "scrap" in blob or "kabadi" in blob:
+        cats.extend(["recyclable", "ewaste"])
+    if any(tags.get(f"recycling:{m}") == "yes" for m in ("glass", "paper", "cardboard", "metal", "plastic", "cans")):
+        cats.append("recyclable")
+    if not cats:
+        cats.append("general")
+    seen: set[str] = set()
+    return [c for c in cats if not (c in seen or seen.add(c))]
+
+
+def map_osm_element(el: dict) -> dict | None:
+    tags = el.get("tags", {})
+    name = tags.get("name") or "Recycling / collection point"
+    loc = el.get("center") or el
+    lat, lng = loc.get("lat"), loc.get("lon")
+    if lat is None or lng is None:
+        return None
+    address_parts = [
+        tags.get(f"addr:{k}") for k in ("house_number", "street", "suburb", "city", "town", "village", "postcode")
+    ]
+    address = ", ".join(p for p in address_parts if p) or "Mapped on OpenStreetMap"
+    return {
+        "id": f"osm-{el.get('type', 'n')}-{el.get('id', 0)}",
+        "name": name,
+        "categories": osm_categories(tags, name),
+        "lat": float(lat),
+        "lng": float(lng),
+        "address": address,
+        "phone": tags.get("phone") or tags.get("contact:phone"),
+        "hours": tags.get("opening_hours"),
+        "accepts": [v.replace("recycling:", "") for k, v in tags.items() if k.startswith("recycling:") and v == "yes"],
+        "source": "osm",
+    }
+
+
+async def refresh_osm(lat: float, lng: float) -> None:
+    """Pull live OSM points around (lat, lng); no-op if the cache is fresh or OSM is unreachable."""
+    latest = await db.facilities.find_one({"source": "osm"}, sort=[("fetched_at", -1)])
+    if latest and latest.get("fetched_at"):
+        fetched = latest["fetched_at"]
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - fetched < CACHE_TTL:
+            return
+    try:
+        query = OVERPASS_QUERY.format(radius=SEARCH_RADIUS_M, lat=lat, lng=lng)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(OVERPASS_URL, content=f"data={query}", headers={"Content-Type": "text/plain"})
+            res.raise_for_status()
+            elements = res.json().get("elements", [])
+        if docs:
+            now = datetime.now(timezone.utc)
+            for el in elements:
+                doc = map_osm_element(el)
+                if doc:
+                    doc["fetched_at"] = now
+                    # upsert by id — never a bulk wipe of the collection in app code
+                    # $set keeps an admin's activate/deactivate choice on refreshed points
+                    await db.facilities.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+            # evict only stale OSM cache entries older than a week (narrow, age-filtered)
+            stale_cutoff = now - timedelta(days=7)
+            await db.facilities.delete_many({"source": "osm", "fetched_at": {"$lt": stale_cutoff}})
+            logger.info("refresh_osm: stored %d OSM facilities", len(docs))
+    except Exception as exc:
+        logger.warning("refresh_osm failed (serving seed data only): %s", exc)
+
+
+async def find_facilities(
+    category: str | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    live: bool = True,
+) -> list[dict]:
+    lat = CHIPLUN_LAT if lat is None else lat
+    lng = CHIPLUN_LNG if lng is None else lng
+    if live:
+        await refresh_osm(lat, lng)
+
+    # deactivated facilities (admin panel) are hidden from citizens and the chat agent
+    docs = await db.facilities.find({"active": {"$ne": False}}, {"_id": 0}).to_list(500)
+    out = []
+    for doc in docs:
+        if category and category not in doc.get("categories", []):
+            continue
+        doc["distance_m"] = round(haversine_m(lat, lng, doc["lat"], doc["lng"]))
+        out.append(doc)
+    out.sort(key=lambda d: d["distance_m"])
+    return out[:40]
+
+
+@router.get("/facilities", response_model=list[Facility])
+async def get_facilities(
+    lat: float | None = None,
+    lng: float | None = None,
+    category: str | None = None,
+    live: bool = True,
+    member: dict = Depends(current_member),
+):
+    return [Facility(**doc) for doc in await find_facilities(category=category, lat=lat, lng=lng, live=live)]
+
+=== FILE: backend/routers/feedback.py ===
+"""Citizen feedback / complaints + admin replies.
+
+POST /api/feedback               citizen sends feedback
+GET  /api/feedback/mine          citizen sees own feedback + admin replies
+GET  /api/admin/feedback         admin list (filter by status / kind)
+PATCH /api/admin/feedback/{id}   admin sets status + reply
+DELETE /api/admin/feedback/{id}  admin removes spam
+"""
+
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from lib.auth import audit, current_member, require_admin
+from lib.db import db
+from models.admin import DeleteResult, Feedback, FeedbackIn, FeedbackReplyIn
+
+router = APIRouter()
+
+
+def _out(doc: dict) -> Feedback:
+    for k in ("created_at", "replied_at"):
+        v = doc.get(k)
+        if isinstance(v, datetime) and v.tzinfo is None:
+            doc[k] = v.replace(tzinfo=timezone.utc)
+    return Feedback(**doc)
+
+
+@router.post("/feedback", response_model=Feedback)
+async def send_feedback(body: FeedbackIn, member: dict = Depends(current_member)):
+    doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": member["user_id"],  # owner always from the session, never the body
+        "user_email": member.get("email", ""),
+        "user_name": member.get("name", ""),
+        "kind": body.kind,
+        "message": body.message.strip(),
+        "status": "open",
+        "admin_reply": "",
+        "replied_at": None,
+        "created_at": datetime.now(timezone.utc),
+    }
+    await db.feedback.insert_one(dict(doc))
+    return _out(doc)
+
+
+@router.get("/feedback/mine", response_model=list[Feedback])
+async def my_feedback(member: dict = Depends(current_member)):
+    docs = await db.feedback.find({"user_id": member["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return [_out(d) for d in docs]
+
+
+@router.get("/admin/feedback", response_model=list[Feedback])
+async def admin_feedback(status: str = "", kind: str = "", admin: dict = Depends(require_admin)):
+    query: dict = {}
+    if status:
+        query["status"] = status
+    if kind:
+        query["kind"] = kind
+    docs = await db.feedback.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return [_out(d) for d in docs]
+
+
+@router.patch("/admin/feedback/{fid}", response_model=Feedback)
+async def admin_reply_feedback(fid: str, body: FeedbackReplyIn, admin: dict = Depends(require_admin)):
+    update: dict = {"status": body.status, "admin_reply": body.admin_reply.strip()}
+    if body.admin_reply.strip():
+        update["replied_at"] = datetime.now(timezone.utc)
+    res = await db.feedback.update_one({"id": fid}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    doc = await db.feedback.find_one({"id": fid}, {"_id": 0})
+    await audit(admin, "reply_feedback", f"{doc.get('user_email', '')} -> {body.status}")
+    return _out(doc)
+
+
+@router.delete("/admin/feedback/{fid}", response_model=DeleteResult)
+async def admin_delete_feedback(fid: str, admin: dict = Depends(require_admin)):
+    doc = await db.feedback.find_one({"id": fid}, {"_id": 0, "user_email": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    res = await db.feedback.delete_one({"id": fid})
+    await audit(admin, "delete_feedback", doc.get("user_email", fid))
+    return DeleteResult(deleted=res.deleted_count)
+
+
+=== FILE: backend/routers/gate.py ===
+"""Presentation PIN gate — keeps the demo app private to the student.
+
+PIN comes from GATE_PIN in backend/.env (default 2026 for the demo).
+The unlock cookie is httpOnly, so the browser cannot fake it from JS.
+"""
+
+import os
+
+from fastapi import APIRouter, HTTPException, Request, Response
+
+from models.waste import GateRequest, GateStatus
+
+router = APIRouter()
+
+COOKIE_NAME = "sw_gate"
+COOKIE_VALUE = "unlocked"
+DEFAULT_PIN = "2026"
+
+
+@router.post("/gate/unlock", response_model=GateStatus)
+async def unlock_gate(body: GateRequest, response: Response):
+    expected = os.environ.get("GATE_PIN", DEFAULT_PIN)
+    if body.pin.strip() != expected:
+        raise HTTPException(status_code=401, detail="Wrong PIN")
+    response.set_cookie(
+        COOKIE_NAME,
+        COOKIE_VALUE,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 12,  # 12 hours — long enough for a demo day
+    )
+    return GateStatus(unlocked=True)
+
+
+@router.get("/gate/status", response_model=GateStatus)
+async def gate_status(request: Request):
+    return GateStatus(unlocked=request.cookies.get(COOKIE_NAME) == COOKIE_VALUE)
+
+
+@router.post("/gate/lock", response_model=GateStatus)
+async def lock_gate(response: Response):
+    response.delete_cookie(COOKIE_NAME)
+    return GateStatus(unlocked=False)
+
+=== FILE: backend/routers/scans.py ===
+"""Citizen scan history + eco-dashboard stats: /api/scans, /api/scans/{id}, /api/stats.
+
+Every query is scoped to the signed-in citizen (user_id from the session).
+The admin sees everyone's records through /api/admin/scans.
+"""
+
+from datetime import timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from lib.auth import current_member
+from lib.db import db
+from models.waste import Classification, ScanDeleteResponse, StatsResponse
+
+router = APIRouter()
+
+
+@router.get("/scans", response_model=list[Classification])
+async def list_scans(limit: int = Query(default=50, ge=1, le=200), member: dict = Depends(current_member)):
+    docs = (
+        await db.scans.find({"user_id": member["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    )
+    for doc in docs:  # motor hands back naive datetimes — normalise to aware UTC
+        created = doc.get("created_at")
+        if created is not None and created.tzinfo is None:
+            doc["created_at"] = created.replace(tzinfo=timezone.utc)
+    return [Classification(**doc) for doc in docs]
+
+
+@router.delete("/scans/{scan_id}", response_model=ScanDeleteResponse)
+async def delete_scan(scan_id: str, member: dict = Depends(current_member)):
+    # owner-scoped: another citizen's record answers 404, same as "not found"
+    result = await db.scans.delete_one({"id": scan_id, "user_id": member["user_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return ScanDeleteResponse(deleted=result.deleted_count)
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats(member: dict = Depends(current_member)):
+    docs = await db.scans.find(
+        {"user_id": member["user_id"]}, {"_id": 0, "category": 1, "eco_points": 1}
+    ).to_list(2000)
+    by_category: dict[str, int] = {}
+    eco_points = 0
+    for doc in docs:
+        cat = doc.get("category", "general")
+        by_category[cat] = by_category.get(cat, 0) + 1
+        eco_points += doc.get("eco_points", 0)
+    return StatsResponse(total_scans=len(docs), eco_points=eco_points, by_category=by_category)
+
+
+=== FILE: backend/routers/tips.py ===
+"""Admin-managed disposal tips / knowledge content (Mongo `tips`).
+
+Active tips are fed to the AI assistant as extra knowledge (see routers/chat.py).
+"""
+
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from lib.auth import audit, require_admin
+from lib.db import db
+from models.admin import DeleteResult, Tip, TipIn
+
+router = APIRouter()
+
+
+def _out(doc: dict) -> Tip:
+    if isinstance(doc.get("updated_at"), datetime) and doc["updated_at"].tzinfo is None:
+        doc["updated_at"] = doc["updated_at"].replace(tzinfo=timezone.utc)
+    return Tip(**doc)
+
+
+@router.get("/admin/tips", response_model=list[Tip])
+async def list_tips(admin: dict = Depends(require_admin)):
+    return [_out(d) for d in await db.tips.find({}, {"_id": 0}).sort("updated_at", -1).to_list(500)]
+
+
+@router.post("/admin/tips", response_model=Tip)
+async def create_tip(body: TipIn, admin: dict = Depends(require_admin)):
+    doc = {**body.model_dump(), "id": f"tip-{uuid.uuid4().hex[:10]}", "updated_at": datetime.now(timezone.utc)}
+    await db.tips.insert_one(dict(doc))
+    await audit(admin, "create_tip", body.title)
+    return _out(doc)
+
+
+@router.put("/admin/tips/{tid}", response_model=Tip)
+async def update_tip(tid: str, body: TipIn, admin: dict = Depends(require_admin)):
+    res = await db.tips.update_one({"id": tid}, {"$set": {**body.model_dump(), "updated_at": datetime.now(timezone.utc)}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Tip not found")
+    await audit(admin, "update_tip", body.title)
+    return _out(await db.tips.find_one({"id": tid}, {"_id": 0}))
+
+
+@router.delete("/admin/tips/{tid}", response_model=DeleteResult)
+async def delete_tip(tid: str, admin: dict = Depends(require_admin)):
+    doc = await db.tips.find_one({"id": tid}, {"_id": 0, "title": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Tip not found")
+    res = await db.tips.delete_one({"id": tid})
+    await audit(admin, "delete_tip", doc["title"])
+    return DeleteResult(deleted=res.deleted_count)
+
+
+=== FILE: backend/seed.py ===
+"""Idempotent seed for the Chiplun facility finder.
+
+Run: cd /app/backend && python seed.py
+Curated demo data for the Chiplun / Khed / Lote MIDC region. Addresses, hours and
+phones are realistic placeholders for the student demo — verify locally before
+any real visit. Live OpenStreetMap data is fetched on top of this at runtime.
+"""
+
+import asyncio
+from datetime import datetime, timezone
+
+from lib.db import db, ensure_indexes
+from lib.guidelines import ensure_default_guidelines
+
+NOW = datetime.now(timezone.utc)
+
+FACILITIES = [
+    {
+        "id": "fac-snm-ewaste-hub",
+        "name": "Sahyadri Nisarg Mitra E-Waste & Conservation Hub",
+        "categories": ["ewaste"],
+        "lat": 17.5365,
+        "lng": 73.5221,
+        "address": "Near Shivaji Nagar, Chiplun 415605",
+        "phone": "+91 2355 252 505",
+        "hours": "9:30 AM - 6:00 PM (Mon-Sat)",
+        "accepts": ["Old laptops", "Smartphones", "PCBs", "Lithium batteries", "Cables"],
+    },
+    {
+        "id": "fac-chiplun-municipal-depot",
+        "name": "Chiplun Municipal Council Scrap & Solid Waste Depot",
+        "categories": ["recyclable", "general"],
+        "lat": 17.5280,
+        "lng": 73.5142,
+        "address": "Bahadur Shaikh Naka, Mumbai-Goa Highway, Chiplun",
+        "phone": "+91 2355 252 022",
+        "hours": "8:00 AM - 5:00 PM (Daily)",
+        "accepts": ["Cardboard", "PET bottles", "Aluminium cans", "Glass bottles"],
+    },
+    {
+        "id": "fac-konkan-scrap-recyclers",
+        "name": "Konkan Scrap Recyclers & Kabadiwala",
+        "categories": ["recyclable", "ewaste"],
+        "lat": 17.5412,
+        "lng": 73.5298,
+        "address": "MIDC Kherdi Road, Chiplun",
+        "phone": "+91 94220 98112",
+        "hours": "9:00 AM - 7:30 PM (Mon-Sat)",
+        "accepts": ["Metal scrap", "Copper wiring", "Newspapers", "Hard plastics"],
+    },
+    {
+        "id": "fac-vashishti-composting",
+        "name": "Vashishti River Basin Community Composting Unit",
+        "categories": ["organic"],
+        "lat": 17.5234,
+        "lng": 73.5091,
+        "address": "Govalkot Road, near Vashishti Riverfront, Chiplun",
+        "phone": "+91 98231 44550",
+        "hours": "7:00 AM - 12:00 PM (Daily)",
+        "accepts": ["Wet kitchen waste", "Garden pruning", "Fruit peels"],
+    },
+    {
+        "id": "fac-hospital-hazardous-drop",
+        "name": "Sub-District Hospital Hazardous & Medical Waste Drop",
+        "categories": ["hazardous", "biomedical"],
+        "lat": 17.5348,
+        "lng": 73.5167,
+        "address": "Station Road, Chiplun",
+        "phone": "+91 2355 253 100",
+        "hours": "24x7 dedicated safe-drop counter",
+        "accepts": ["Expired medicines", "Syringes", "Sanitary waste", "Chemical containers"],
+    },
+    {
+        "id": "fac-lote-midc-collection",
+        "name": "Lote Parshuram MIDC Industrial Waste Collection Point",
+        "categories": ["recyclable", "ewaste", "hazardous"],
+        "lat": 17.4521,
+        "lng": 73.4721,
+        "address": "Lote Parshuram MIDC, Tal. Chiplun",
+        "phone": "+91 2355 264 110",
+        "hours": "10:00 AM - 5:00 PM (Mon-Fri)",
+        "accepts": ["Industrial scrap", "Used oils (authorized only)", "E-waste bulk lots"],
+    },
+    {
+        "id": "fac-khed-dry-waste-center",
+        "name": "Khed Municipal Council Dry Waste Collection Centre",
+        "categories": ["recyclable", "general"],
+        "lat": 17.7215,
+        "lng": 73.6853,
+        "address": "Khed, Ratnagiri District",
+        "phone": "+91 2356 252 300",
+        "hours": "9:00 AM - 5:00 PM (Mon-Sat)",
+        "accepts": ["Dry waste", "Paper", "Plastics", "Glass"],
+    },
+]
+
+
+async def main() -> None:
+    docs = [{**f, "source": "seed", "fetched_at": NOW} for f in FACILITIES]
+    for doc in docs:  # insert-if-missing by id — never overwrites an admin's edits
+        await db.facilities.update_one({"id": doc["id"]}, {"$setOnInsert": doc}, upsert=True)
+    await ensure_default_guidelines()  # the 6 default categories (first run only)
+    await ensure_indexes()
+    print(f"Seeded {len(docs)} facilities for the Chiplun region.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+=== FILE: backend/server.py ===
+import asyncio
+from contextlib import asynccontextmanager, suppress
+from fastapi import FastAPI, APIRouter
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List
+import uuid
+from datetime import datetime
+
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+from lib.db import client, db, ensure_indexes
+
+
+# Startup runs before the yield, shutdown after it. Add your own setup/teardown here.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.index_task = asyncio.create_task(ensure_indexes())  # background: a big index build must not block boot
+    from lib.auth import move_retired_roles
+    with suppress(Exception):
+        await move_retired_roles()
+    yield
+    app.state.index_task.cancel()  # stop a build still running before its client closes
+    with suppress(asyncio.CancelledError):
+        await app.state.index_task
+    client.close()
+
+
+# Create the main app without a prefix
+app = FastAPI(lifespan=lifespan)
+
+from lib.security import secure_headers_middleware  # noqa: E402
+
+app.middleware("http")(secure_headers_middleware)
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+
+# Define Models
+class StatusCheck(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class StatusCheckCreate(BaseModel):
+    client_name: str
+
+# Add your routes to the router instead of directly to app
+@api_router.get("/")
+async def root():
+    return {"message": "Hello World"}
+
+@api_router.post("/status", response_model=StatusCheck)
+async def create_status_check(input: StatusCheckCreate):
+    status_dict = input.model_dump()
+    status_obj = StatusCheck(**status_dict)
+    _ = await db.status_checks.insert_one(status_obj.model_dump())
+    return status_obj
+
+@api_router.get("/status", response_model=List[StatusCheck])
+async def get_status_checks():
+    status_checks = await db.status_checks.find().to_list(1000)
+    return [StatusCheck(**status_check) for status_check in status_checks]
+
+# Feature routers — each module exposes an APIRouter mounted on the /api router
+from routers import admin, chat, classify, doorstep, facilities, feedback, gate, scans, tips
+
+try:  # launched as `backend.server` (the default)
+    from backend.clerk_auth import clerk_router, require_user  # noqa: F401
+except ModuleNotFoundError:  # launched from inside backend/ as `server`
+    from clerk_auth import clerk_router, require_user  # noqa: F401
+
+api_router.include_router(classify.router)
+api_router.include_router(chat.router)
+api_router.include_router(facilities.router)
+api_router.include_router(scans.router)
+api_router.include_router(gate.router)
+api_router.include_router(feedback.router)
+api_router.include_router(admin.router)
+api_router.include_router(tips.router)
+api_router.include_router(doorstep.router)  # Doorstep Garbage Vehicle (DEMO)
+
+
+@api_router.get("/health")
+async def health():
+    """Public health check: database + AI configuration (never returns secrets)."""
+    from lib.db import db as _db
+    from lib.gemini import is_configured, model_name
+
+    try:
+        await _db.command("ping")
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {"status": "ok" if db_ok else "degraded", "database": db_ok, "ai_configured": is_configured(), "ai_model": model_name(), "ai_fallback_model": os.environ.get("GEMINI_FALLBACK_MODEL", "")}
+
+
+app.include_router(clerk_router)  # /api/clerk/config and /api/__clerk/*
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+=== FILE: backend/tests/__init__.py ===
+
+
+=== FILE: backend/tests/conftest.py ===
+"""Pre-scaffolded pytest fixtures for the FastAPI backend.
+
+Tests hit the live uvicorn process managed by supervisor (not an in-process ASGI app), so
+the app under test is the same one the frontend and Playwright see. Do NOT re-create this
+file — add app-specific fixtures below the marker at the bottom.
+"""
+
+import os
+
+import httpx
+import pytest
+import pytest_asyncio
+
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8001")
+API_URL = f"{BACKEND_URL}/api"
+
+
+def api_url(path: str = "") -> str:
+    """Absolute URL for an /api route: api_url("/status") -> http://localhost:8001/api/status."""
+    return f"{API_URL}{path}"
+
+
+@pytest.fixture(scope="session")
+def backend_url() -> str:
+    return BACKEND_URL
+
+
+@pytest.fixture
+def client():
+    """Sync httpx client rooted at /api — the default for endpoint tests.
+
+    Example:
+        def test_status(client):
+            assert client.get("/status").status_code == 200
+    """
+    with httpx.Client(base_url=API_URL, timeout=30.0) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def aclient():
+    """Async variant, for tests that also await motor/backend helpers directly."""
+    async with httpx.AsyncClient(base_url=API_URL, timeout=30.0) as c:
+        yield c
+
+
+# --- app-specific fixtures below this line ---
+
+
+=== FILE: backend/tests/make_test_tokens.py ===
+"""Dev-only helper: create/reuse Clerk test users (admin + citizen) and mint
+short-lived session tokens -> /tmp/tokens.json. Never prints the secret key.
+
+Run: cd /app/backend && python tests/make_test_tokens.py
+"""
+
+import asyncio
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+SK = os.environ["CLERK_SECRET_KEY"]
+
+USERS = {
+    "admin": "swachh-admin+clerk_test@example.com",
+    "citizen": "swachh-citizen+clerk_test@example.com",
+    "citizen2": "swachh-citizen2+clerk_test@example.com",
+}
+PASSWORD = "Test-pass-12345!"
+
+
+def bapi(method: str, path: str, body: dict | None = None):
+    req = urllib.request.Request(
+        "https://api.clerk.com/v1" + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={"Authorization": "Bearer " + SK, "Content-Type": "application/json", "User-Agent": "emergent-test"},
+    )
+    return json.load(urllib.request.urlopen(req))
+
+
+def get_or_create(email: str) -> dict:
+    found = bapi("GET", "/users?" + urllib.parse.urlencode({"email_address": email}))
+    if found:
+        return found[0]
+    return bapi("POST", "/users", {"email_address": [email], "password": PASSWORD, "skip_password_checks": True})
+
+
+async def set_roles(ids: dict) -> None:
+    from lib.db import db
+
+    for role_name, uid in ids.items():
+        role = "admin" if role_name == "admin" else "citizen"
+        await db.users.update_one(
+            {"user_id": uid},
+            {"$set": {"role": role, "env": "preview", "email": USERS[role_name], "name": role_name.title() + " Tester"}},
+            upsert=True,
+        )
+
+
+def main() -> None:
+    out = {}
+    ids = {}
+    for role_name, email in USERS.items():
+        user = get_or_create(email)
+        ids[role_name] = user["id"]
+        session = bapi("POST", "/sessions", {"user_id": user["id"]})
+        token = bapi("POST", f"/sessions/{session['id']}/tokens", {"expires_in_seconds": 3600})["jwt"]
+        ticket = bapi("POST", "/sign_in_tokens", {"user_id": user["id"], "expires_in_seconds": 3600})["token"]
+        out[role_name] = {"user_id": user["id"], "email": email, "token": token, "ticket": ticket}
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    asyncio.run(set_roles(ids))
+    with open("/tmp/tokens.json", "w") as f:
+        json.dump(out, f)
+    print("tokens written for:", ", ".join(f"{k}={v['email']}" for k, v in out.items()))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except urllib.error.HTTPError as e:
+        print("Clerk API error", e.code, e.read()[:300])
+        raise
+
+
+=== FILE: backend/tests/regression_run.py ===
+"""Regression run for the AI features: 10 waste photos + 3 chat questions.
+
+Run (backend running on :8001, test tokens minted first):
+    cd backend && python tests/make_test_tokens.py
+    python tests/regression_run.py before     # or: after
+Writes docs/regression_<label>.json. Uses the citizen test account token.
+"""
+
+import base64
+import io
+import json
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+from PIL import Image
+
+API = "http://localhost:8001/api"
+ROOT = Path(__file__).resolve().parents[2]
+
+SAMPLES = [
+    ("ewaste", "Broken smartphone", "https://images.unsplash.com/photo-1746006084492-24a8fd02710a?w=800&q=80&fm=jpg"),
+    ("ewaste", "Old mobile phones", "https://images.unsplash.com/photo-1587017234728-932c80f3e56f?w=800&q=80&fm=jpg"),
+    ("recyclable", "Plastic water bottle", "https://images.unsplash.com/photo-1616118132534-381148898bb4?w=800&q=80&fm=jpg"),
+    ("recyclable", "Empty plastic bottles", "https://images.pexels.com/photos/5719820/pexels-photo-5719820.jpeg?auto=compress&w=800"),
+    ("organic", "Banana peel", "https://images.unsplash.com/photo-1579523360589-120f265e0988?w=800&q=80&fm=jpg"),
+    ("organic", "Peeled banana", "https://images.unsplash.com/photo-1579523360595-bee0f3b9fafb?w=800&q=80&fm=jpg"),
+    ("hazardous", "Spray paint cans", "https://images.unsplash.com/photo-1642708831052-2402ef1f8a8b?w=800&q=80&fm=jpg"),
+    ("hazardous", "Rusty paint cans", "https://images.pexels.com/photos/15818563/pexels-photo-15818563.jpeg?auto=compress&w=800"),
+    ("biomedical", "Used syringe", "https://images.unsplash.com/photo-1643401226147-1b0f88071bbe?w=800&q=80&fm=jpg"),
+    ("general", "Mixed dirty garbage", "https://images.unsplash.com/photo-1577369083609-051feb777894?w=800&q=80&fm=jpg"),
+]
+
+CHATS = [
+    "What do I do with a broken tube light?",
+    "Where can I dispose of old batteries in Chiplun?",
+    "What is the capital of India?",  # general question — must answer politely
+]
+
+
+def fetch_b64(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    raw = urllib.request.urlopen(req, timeout=30).read()
+    im = Image.open(io.BytesIO(raw)).convert("RGB")
+    im.thumbnail((1024, 1024))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def post(path: str, body: dict, token: str) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        API + path,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+    )
+    try:
+        res = urllib.request.urlopen(req, timeout=120)
+        return res.status, json.load(res)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
+def main() -> None:
+    label = sys.argv[1] if len(sys.argv) > 1 else "run"
+    token = json.load(open("/tmp/tokens.json"))["citizen"]["token"]
+    rows = []
+    for expected, name, url in SAMPLES:
+        t0 = time.time()
+        try:
+            code, d = post("/classify", {"image_base64": fetch_b64(url), "mime_type": "image/jpeg", "language": "en"}, token)
+        except Exception as exc:  # download failure etc.
+            code, d = 0, {"detail": str(exc)}
+        rows.append({
+            "sample": name,
+            "expected": expected,
+            "status": code,
+            "category": d.get("category"),
+            "item_name": d.get("item_name"),
+            "confidence": d.get("confidence"),
+            "first_step": (d.get("disposal_steps") or [""])[0],
+            "seconds": round(time.time() - t0, 1),
+            "detail": d.get("detail"),
+        })
+        print(f"{name:24s} expected={expected:11s} got={d.get('category')} conf={d.get('confidence')} status={code}")
+    chats = []
+    for q in CHATS:
+        code, d = post("/chat", {"message": q, "language": "en", "history": []}, token)
+        chats.append({"question": q, "status": code, "fallback": d.get("fallback"), "reply": (d.get("reply") or "")[:300],
+                      "facilities_used": len(d.get("facilities_used") or [])})
+        print(f"chat: {q[:40]:40s} status={code} fallback={d.get('fallback')} facilities={len(d.get('facilities_used') or [])}")
+    out = ROOT / "docs" / f"regression_{label}.json"
+    out.write_text(json.dumps({"scans": rows, "chats": chats}, indent=2, ensure_ascii=False))
+    print("saved", out)
+
+
+if __name__ == "__main__":
+    main()
+
+

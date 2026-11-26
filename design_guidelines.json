@@ -1,0 +1,268 @@
+{
+  "theme_strategy": {
+    "default_mode": "light",
+    "mode_toggle_supported": true,
+    "rationale": "Organic, ecological, and civil-tech dashboard theme anchored in Sahyadri Konkan environmental aesthetics. Earthy emeralds, warm stone, and crisp tactile panels with high contrast for mobile inspection and daylight demo presentation."
+  },
+  "entry_surfaces": {
+    "/": "split hero & pin-lock entry — brand identity with Chiplun Sahyadri credentials on left/top, 4-digit demo PIN keypad & project overview on right/bottom",
+    "/scan": "interactive camera viewfinder & file dropzone with real-time classification preview and barcode/hint inputs",
+    "/assistant": "multilingual AI waste assistant split interface with quick prompts, classifier context injection, and voice/audio toggles",
+    "/facilities": "interactive Leaflet Chiplun map container with waste category filters, distance cards, and route guidance",
+    "/dashboard": "gamified scan analytics grid with waste composition charts, eco-points tracker, and Sahyadri Nisarg Mitra impact stats"
+  },
+  "colors": {
+    "surfaces": [
+      {
+        "name": "page",
+        "kind": "solid",
+        "bg": "#F4F7F4",
+        "on_bg": "#14261C",
+        "on_bg_muted": "#40594B",
+        "roles": {
+          "link": "#15803D",
+          "error": "#B91C1C",
+          "success": "#15803D",
+          "warning": "#B45309"
+        }
+      },
+      {
+        "name": "panel",
+        "kind": "solid",
+        "bg": "#FFFFFF",
+        "on_bg": "#112217",
+        "on_bg_muted": "#4B6354",
+        "roles": {
+          "link": "#15803D",
+          "error": "#DC2626",
+          "success": "#16A34A",
+          "warning": "#D97706"
+        }
+      },
+      {
+        "name": "panel_dark",
+        "kind": "solid",
+        "bg": "#0D1B13",
+        "on_bg": "#ECFDF5",
+        "on_bg_muted": "#9CB8A6",
+        "roles": {
+          "link": "#34D399",
+          "error": "#F87171",
+          "success": "#4ADE80",
+          "warning": "#FBBF24"
+        }
+      },
+      {
+        "name": "ewaste_pill",
+        "kind": "solid",
+        "bg": "#FEF3C7",
+        "on_bg": "#78350F",
+        "on_bg_muted": "#92400E"
+      },
+      {
+        "name": "recyclable_pill",
+        "kind": "solid",
+        "bg": "#DBEAFE",
+        "on_bg": "#1E40AF",
+        "on_bg_muted": "#1D4ED8"
+      },
+      {
+        "name": "organic_pill",
+        "kind": "solid",
+        "bg": "#DCFCE7",
+        "on_bg": "#14532D",
+        "on_bg_muted": "#166534"
+      },
+      {
+        "name": "hazardous_pill",
+        "kind": "solid",
+        "bg": "#FEE2E2",
+        "on_bg": "#7F1D1D",
+        "on_bg_muted": "#991B1B"
+      },
+      {
+        "name": "hero",
+        "kind": "image",
+        "contrast_against": "#0D1B13",
+        "guarantee": "scrim: linear-gradient(180deg, rgba(13,27,19,0.85) 0%, rgba(13,27,19,0.72) 100%)",
+        "on_bg": "#FFFFFF",
+        "on_bg_muted": "#D1E2D7",
+        "roles": {
+          "link": "#6EE7B7",
+          "error": "#FCA5A5",
+          "success": "#86EFAC"
+        }
+      },
+      {
+        "name": "glass_header",
+        "kind": "glass",
+        "contrast_against": "#F4F7F4",
+        "guarantee": "backdrop-blur-xl bg-white/90 border-b border-emerald-900/10",
+        "on_bg": "#0E2417",
+        "on_bg_muted": "#3D5749"
+      }
+    ],
+    "accent": "#15803D",
+    "on_accent": "#FFFFFF",
+    "secondary_accent": "#D97706",
+    "on_secondary_accent": "#FFFFFF"
+  },
+  "typography": {
+    "font_heading": "Outfit Variable",
+    "font_body": "Plus Jakarta Sans Variable",
+    "scale_px": {
+      "display": 52,
+      "h1": 40,
+      "h2": 30,
+      "h3": 22,
+      "body": 16,
+      "caption": 14
+    },
+    "rules": {
+      "headlines": "font-heading font-bold tracking-tight text-emerald-950 dark:text-emerald-50",
+      "overlines": "text-xs uppercase tracking-[0.2em] font-semibold text-emerald-800 dark:text-emerald-300",
+      "body": "font-sans leading-relaxed text-slate-800 dark:text-slate-200",
+      "marathi_hindi_support": "Clean unicode fallback rendering with explicit lang attributes for EN/MR/HI text switches"
+    }
+  },
+  "layouts": {
+    "mobile_first": true,
+    "navigation": "Sticky glass header with Sahyadri NGO badge, language toggle (EN/HI/MR), Demo Status indicator, and bottom mobile navigation bar on handheld screens (Scan, AI Chat, Facilities Map, Analytics Dashboard)",
+    "grid_structure": "Responsive bento grid with `grid-cols-1 md:grid-cols-12` and generous `gap-4 md:gap-6` spacing",
+    "containers": "Solid tactile panels with `p-4 sm:p-6 md:p-8`, `rounded-2xl`, subtle border `border-emerald-950/8` and warm ambient shadow `shadow-sm`"
+  },
+  "motion": {
+    "transitions": "transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease, border-color 0.15s ease",
+    "card_hover": "hover:-translate-y-0.5 hover:shadow-md hover:border-emerald-700/30",
+    "camera_pulse": "animate-pulse for live camera scanner targeting reticle",
+    "reduced_motion": "@media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }"
+  },
+  "accessibility": {
+    "wcag_level": "WCAG AA (minimum 4.5:1 text contrast)",
+    "data_testid_convention": "kebab-case functional IDs on all buttons, tabs, inputs, cards, map pins, and chat controls",
+    "aria_labels": "Explicit aria-label attributes on icon-only buttons, camera toggles, language switchers, and audio controls",
+    "keyboard_nav": "Full tab ordering, enter/space trigger on custom category chips and map selector lists"
+  },
+  "image_urls": {
+    "hero_and_regions": [
+      {
+        "url": "https://images.pexels.com/photos/35775956/pexels-photo-35775956.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Ratnagiri Konkan coastline and lush Sahyadri foothills for region backdrop and NGO context banner",
+        "category": "hero_background"
+      },
+      {
+        "url": "https://images.pexels.com/photos/19115417/pexels-photo-19115417.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "River bridge and lush greenery in Western Ghats Konkan belt for ecological conservation storytelling",
+        "category": "region_landscape"
+      }
+    ],
+    "waste_samples": [
+      {
+        "url": "https://images.pexels.com/photos/38411739/pexels-photo-38411739.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Obsolete printed circuit boards and e-waste components for sample classification & demo test cards",
+        "category": "ewaste_sample"
+      },
+      {
+        "url": "https://images.pexels.com/photos/19037726/pexels-photo-19037726.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Old mobile phone collection stacked for battery and e-waste recycling",
+        "category": "ewaste_phones"
+      },
+      {
+        "url": "https://images.pexels.com/photos/31416070/pexels-photo-31416070.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Home organic composting and kitchen biodegradable waste processing",
+        "category": "organic_compost"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1604187351574-c75ca79f5807?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2MjJ8MHwxfHNlYXJjaHwxfHxlJTIwd2FzdGUlMjByZWN5Y2xpbmclMjB0ZWNobm9sb2d5fGVufDB8fHx8MTc5NDg0MTUwN3ww&ixlib=rb-4.1.0&q=85",
+        "description": "Recyclable plastic container bin with prominent universal recycling symbol",
+        "category": "recyclable_sample"
+      }
+    ]
+  },
+  "chiplun_geo_context": {
+    "center_lat": 17.5323,
+    "center_lng": 73.5186,
+    "region_name": "Chiplun, Ratnagiri District, Maharashtra",
+    "partner_ngo": "Sahyadri Nisarg Mitra (SNM)",
+    "key_facilities_seeded": [
+      {
+        "id": "fac-1",
+        "name": "Sahyadri Nisarg Mitra E-Waste & Conservation Hub",
+        "category": "E-waste",
+        "lat": 17.5365,
+        "lng": 73.5221,
+        "address": "Near Shivaji Nagar, Chiplun - 415605",
+        "phone": "+91 2355 252 505",
+        "timings": "9:30 AM - 6:00 PM (Mon-Sat)",
+        "accepts": ["Old Laptops", "Smartphones", "PCBs", "Lithium Batteries", "Cables"],
+        "reward_rate": "25 Eco Points / kg"
+      },
+      {
+        "id": "fac-2",
+        "name": "Chiplun Municipal Council Scrap & Solid Waste Depot",
+        "category": "Recyclable",
+        "lat": 17.528,
+        "lng": 73.5142,
+        "address": "Bahadur Shaikh Naka, Mumbai-Goa Highway, Chiplun",
+        "phone": "+91 2355 252 022",
+        "timings": "8:00 AM - 5:00 PM (Daily)",
+        "accepts": ["Cardboard", "PET Bottles", "Aluminium Cans", "Glass Bottles"],
+        "reward_rate": "10 Eco Points / kg"
+      },
+      {
+        "id": "fac-3",
+        "name": "Konkan Scrap Recyclers & Kabadiwala",
+        "category": "Recyclable",
+        "lat": 17.5412,
+        "lng": 73.5298,
+        "address": "MIDC Kherdi Road, Chiplun",
+        "phone": "+91 94220 98112",
+        "timings": "9:00 AM - 7:30 PM (Mon-Sat)",
+        "accepts": ["Metal Scrap", "Copper Wiring", "Newspapers", "Hard Plastics"],
+        "reward_rate": "15 Eco Points / kg"
+      },
+      {
+        "id": "fac-4",
+        "name": "Vashishti River Basin Community Composting Unit",
+        "category": "Organic",
+        "lat": 17.5234,
+        "lng": 73.5091,
+        "address": "Govalkot Road, Near Vashishti Riverfront, Chiplun",
+        "phone": "+91 98231 44550",
+        "timings": "7:00 AM - 12:00 PM (Daily)",
+        "accepts": ["Wet Kitchen Waste", "Garden Pruning", "Fruit Peels", "Bio-degradable Plates"],
+        "reward_rate": "20 Eco Points / delivery"
+      },
+      {
+        "id": "fac-5",
+        "name": "Sub-District Hospital Hazardous & Medical Waste Drop",
+        "category": "Hazardous",
+        "lat": 17.5348,
+        "lng": 73.5167,
+        "address": "Station Road, Chiplun",
+        "phone": "+91 2355 253 100",
+        "timings": "24/7 Dedicated Safe Drop Counter",
+        "accepts": ["Expired Medicines", "Syringes", "Sanitary Waste", "Chemical Containers"],
+        "reward_rate": "10 Eco Points / safe drop"
+      }
+    ]
+  },
+  "component_hierarchy": {
+    "app_shell": "frontend/src/App.tsx with route switch + persistent bottom mobile bar",
+    "auth_gate": "frontend/src/components/PinGateModal.tsx (PIN: 2026 or 1234 demo unlock with quick hint)",
+    "scanner": "frontend/src/components/WasteScanner.tsx (Live camera stream / image upload / barcode / text hint + AI confidence & disposal guide)",
+    "chatbot": "frontend/src/components/AiAssistant.tsx (Multilingual EN/HI/MR agent with India E-Waste 2022 rules, composting guide, audio reader, and map linking)",
+    "map_view": "frontend/src/components/FacilityMap.tsx (Leaflet with custom map tiles, category filtering, distance calculations, and directions modal)",
+    "dashboard": "frontend/src/components/EcoDashboard.tsx (Recharts scan history, pie breakdown, Sahyadri NGO target metric, and eco points leaderboard)"
+  },
+  "instructions_to_main_agent": [
+    "Install `leaflet` and `@types/leaflet` via yarn before building map components (`yarn add leaflet @types/leaflet`).",
+    "Use pre-bundled `recharts` for category breakdown and scan history chart visualization.",
+    "Implement the PIN Gate screen (default student demo PIN `2026` with visual keypad, quick demo bypass button, and student project banner).",
+    "Ensure multilingual support in AI Assistant with seamless language tabs: English, Hindi (हिंदी), and Marathi (मराठी) with local context on Chiplun, Ratnagiri, and E-Waste Management Rules 2022 (CPCB).",
+    "Provide sample waste photo presets (E-waste motherboard, PET bottle, Coconut shell/organic, Li-ion battery, Cardboard) so evaluator can test classification instantly even without live camera feed.",
+    "Include high-contrast badges for categories: E-Waste (Amber), Recyclable (Blue), Organic (Green), Hazardous (Red), General (Slate).",
+    "Add 'data-testid' to all interactive elements, camera trigger, file input, language buttons, PIN buttons, filter chips, and map action cards.",
+    "Ensure mobile-responsive ergonomics with sticky bottom navigation tabs on small screens and intuitive touch targets."
+  ]
+}

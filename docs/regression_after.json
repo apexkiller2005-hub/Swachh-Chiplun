@@ -1,0 +1,137 @@
+{
+  "scans": [
+    {
+      "sample": "Broken smartphone",
+      "expected": "ewaste",
+      "status": 200,
+      "category": "ewaste",
+      "item_name": "Broken Mobile Phone",
+      "confidence": 0.98,
+      "first_step": "Keep the item intact and dry; do not break or burn it.",
+      "seconds": 1.8,
+      "detail": null
+    },
+    {
+      "sample": "Old mobile phones",
+      "expected": "ewaste",
+      "status": 200,
+      "category": "ewaste",
+      "item_name": "Old Mobile Phones (Juna Mobile)",
+      "confidence": 0.98,
+      "first_step": "Keep the items intact and dry; do not break or burn them.",
+      "seconds": 1.5,
+      "detail": null
+    },
+    {
+      "sample": "Plastic water bottle",
+      "expected": "recyclable",
+      "status": 200,
+      "category": "recyclable",
+      "item_name": "PET Plastic Bottle (Plastic Chiwani)",
+      "confidence": 0.98,
+      "first_step": "Empty, rinse and dry the item.",
+      "seconds": 1.4,
+      "detail": null
+    },
+    {
+      "sample": "Empty plastic bottles",
+      "expected": "recyclable",
+      "status": 200,
+      "category": "recyclable",
+      "item_name": "PET plastic bottles [Plastic chippi]",
+      "confidence": 0.98,
+      "first_step": "Empty, rinse and dry the item.",
+      "seconds": 1.4,
+      "detail": null
+    },
+    {
+      "sample": "Banana peel",
+      "expected": "organic",
+      "status": 200,
+      "category": "organic",
+      "item_name": "Banana peel (Kelyache sal)",
+      "confidence": 0.99,
+      "first_step": "Keep it separate from plastic and dry waste.",
+      "seconds": 1.3,
+      "detail": null
+    },
+    {
+      "sample": "Peeled banana",
+      "expected": "organic",
+      "status": 200,
+      "category": "organic",
+      "item_name": "Banana Peel (Kelyachi Sal)",
+      "confidence": 0.98,
+      "first_step": "Keep it separate from plastic and dry waste.",
+      "seconds": 1.3,
+      "detail": null
+    },
+    {
+      "sample": "Spray paint cans",
+      "expected": "hazardous",
+      "status": 200,
+      "category": "hazardous",
+      "item_name": "Spray Paint Can (Aerosol Can)",
+      "confidence": 0.98,
+      "first_step": "Safety first: keep it closed, labelled and away from children.",
+      "seconds": 1.4,
+      "detail": null
+    },
+    {
+      "sample": "Rusty paint cans",
+      "expected": "hazardous",
+      "status": 200,
+      "category": "hazardous",
+      "item_name": "Aerosol spray paint can",
+      "confidence": 0.98,
+      "first_step": "Safety first: keep it closed, labelled and away from children.",
+      "seconds": 1.4,
+      "detail": null
+    },
+    {
+      "sample": "Used syringe",
+      "expected": "biomedical",
+      "status": 200,
+      "category": "biomedical",
+      "item_name": "Syringe",
+      "confidence": 0.98,
+      "first_step": "Safety first: wrap it in paper and seal it in a bag.",
+      "seconds": 1.2,
+      "detail": null
+    },
+    {
+      "sample": "Mixed dirty garbage",
+      "expected": "general",
+      "status": 200,
+      "category": "general",
+      "item_name": "Mixed Waste Pile",
+      "confidence": 0.5,
+      "first_step": "Sort the mixed pile into individual items like plastic, paper, and metal scrubber.",
+      "seconds": 1.3,
+      "detail": null
+    }
+  ],
+  "chats": [
+    {
+      "question": "What do I do with a broken tube light?",
+      "status": 200,
+      "fallback": false,
+      "reply": "Safety first: Broken tube lights contain trace amounts of toxic mercury powder and sharp glass. Handle with extreme care and keep them away from children and pets!\n\n**How to handle and dispose of a broken tube-light:**\n* **Wear gloves:** Protect your hands from sharp glass shards.\n* **Seal securely:",
+      "facilities_used": 3
+    },
+    {
+      "question": "Where can I dispose of old batteries in Chiplun?",
+      "status": 200,
+      "fallback": false,
+      "reply": "Old batteries (including lithium-ion, rechargeable, and button cells) fall under **E-waste** (E-Waste Management Rules 2022). \n\n**Handling steps:**\n- Safety first: Keep batteries intact, dry, and never puncture, crush, or burn them.\n- Store them safely in a closed plastic container or tape the termi",
+      "facilities_used": 3
+    },
+    {
+      "question": "What is the capital of India?",
+      "status": 200,
+      "fallback": true,
+      "reply": "AI is busy, please try again in a minute.\n\nSorry, I could not reach the AI service just now. General rule: keep the item dry, segregate it from kitchen waste, and hand it over at your nearest collection centre. For electronics, use only an authorised e-waste recycler; never burn or dump waste in the",
+      "facilities_used": 0
+    }
+  ]
+}

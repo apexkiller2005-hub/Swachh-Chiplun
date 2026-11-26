@@ -1,0 +1,137 @@
+{
+  "scans": [
+    {
+      "sample": "Broken smartphone",
+      "expected": "ewaste",
+      "status": 200,
+      "category": "ewaste",
+      "item_name": "Broken mobile phone (smartphone)",
+      "confidence": 0.99,
+      "first_step": "Keep the phone intact and dry; avoid further breaking the cracked screen and keep it away from children.",
+      "seconds": 8.8,
+      "detail": null
+    },
+    {
+      "sample": "Old mobile phones",
+      "expected": "ewaste",
+      "status": 200,
+      "category": "ewaste",
+      "item_name": "Mobile phone",
+      "confidence": 0.96,
+      "first_step": "Keep the phone intact and dry; do not break, burn or throw it in a regular bin.",
+      "seconds": 5.0,
+      "detail": null
+    },
+    {
+      "sample": "Plastic water bottle",
+      "expected": "recyclable",
+      "status": 200,
+      "category": "recyclable",
+      "item_name": "Plastic water bottle (PET bottle)",
+      "confidence": 0.98,
+      "first_step": "Empty, rinse and dry the bottle.",
+      "seconds": 2.7,
+      "detail": null
+    },
+    {
+      "sample": "Empty plastic bottles",
+      "expected": "recyclable",
+      "status": 200,
+      "category": "recyclable",
+      "item_name": "Plastic water bottle (PET bottle)",
+      "confidence": 0.96,
+      "first_step": "Empty, rinse and dry the bottle.",
+      "seconds": 2.9,
+      "detail": null
+    },
+    {
+      "sample": "Banana peel",
+      "expected": "organic",
+      "status": 200,
+      "category": "organic",
+      "item_name": "Banana peel",
+      "confidence": 0.99,
+      "first_step": "Keep it separate from plastic and dry waste.",
+      "seconds": 2.8,
+      "detail": null
+    },
+    {
+      "sample": "Peeled banana",
+      "expected": "organic",
+      "status": 200,
+      "category": "organic",
+      "item_name": "Banana peel",
+      "confidence": 0.99,
+      "first_step": "Keep it separate from plastic and dry waste.",
+      "seconds": 2.8,
+      "detail": null
+    },
+    {
+      "sample": "Spray paint cans",
+      "expected": "hazardous",
+      "status": 200,
+      "category": "hazardous",
+      "item_name": "Aerosol spray paint can",
+      "confidence": 0.97,
+      "first_step": "Safety first: keep the can closed, upright and away from heat, sparks and children.",
+      "seconds": 5.6,
+      "detail": null
+    },
+    {
+      "sample": "Rusty paint cans",
+      "expected": "hazardous",
+      "status": 200,
+      "category": "hazardous",
+      "item_name": "Aerosol spray paint can",
+      "confidence": 0.96,
+      "first_step": "Safety first: keep the can closed, upright and away from heat, sparks and children.",
+      "seconds": 5.1,
+      "detail": null
+    },
+    {
+      "sample": "Used syringe",
+      "expected": "biomedical",
+      "status": 200,
+      "category": "biomedical",
+      "item_name": "Syringe",
+      "confidence": 0.98,
+      "first_step": "Safety first: do not recap, bend or break the syringe; keep it away from children and pets.",
+      "seconds": 3.8,
+      "detail": null
+    },
+    {
+      "sample": "Mixed dirty garbage",
+      "expected": "general",
+      "status": 200,
+      "category": "recyclable",
+      "item_name": "Plastic cup",
+      "confidence": 0.74,
+      "first_step": "Empty, rinse and dry the item.",
+      "seconds": 2.2,
+      "detail": null
+    }
+  ],
+  "chats": [
+    {
+      "question": "What do I do with a broken tube light?",
+      "status": 200,
+      "fallback": false,
+      "reply": "Safety warning: A broken tube-light can release small amounts of mercury. Keep children and pets away, and do not sweep harshly or use bare hands.\n\nWhat to do:\n- Open windows and air the room for 15–30 minutes.\n- Wear gloves if available.\n- Carefully pick up large pieces with stiff paper/cardboard.\n",
+      "facilities_used": 0
+    },
+    {
+      "question": "Where can I dispose of old batteries in Chiplun?",
+      "status": 200,
+      "fallback": false,
+      "reply": "⚠️ Safety: Old batteries are e-waste. Keep them dry, do not crush/puncture them, and keep them away from children.\n\nBest nearby option in Chiplun:\n- Sahyadri Nisarg Mitra E-Waste & Conservation Hub\n- Near Shivaji Nagar, Chiplun 415605\n- Accepts lithium batteries\n- Hours: 9:30 AM – 6:00 PM, Mon–Sat\n-",
+      "facilities_used": 3
+    },
+    {
+      "question": "What is the capital of India?",
+      "status": 200,
+      "fallback": false,
+      "reply": "New Delhi.\n\nIf you want, I can also help with waste questions in Chiplun, like how to dispose of batteries, bulbs, medicines, or kitchen waste.",
+      "facilities_used": 0
+    }
+  ]
+}
