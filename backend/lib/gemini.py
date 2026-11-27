@@ -8,6 +8,7 @@ Every failure becomes an AIError with a friendly, user-facing message.
 import asyncio
 import logging
 import os
+import time
 
 import httpx
 from google import genai
@@ -69,9 +70,26 @@ def client() -> genai.Client:
 # Each entry must support the features we use: images, structured output, tools.
 MODEL_FALLBACKS = ["gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.6-flash"]
 
+# Cooldown for models that recently returned a capacity/quota error, so we don't
+# waste a round-trip (and the user's time) re-probing an exhausted model.
+_MODEL_COOLDOWN: dict[str, float] = {}
+_COOLDOWN_SECONDS = 300.0
+
+
+def _on_cooldown(model: str) -> bool:
+    return time.time() < _MODEL_COOLDOWN.get(model, 0.0)
+
+
+def _cooldown(model: str) -> None:
+    _MODEL_COOLDOWN[model] = time.time() + _COOLDOWN_SECONDS
+
 
 async def generate(contents, config: types.GenerateContentConfig):
-    """Gemini call with automatic model fallback + retry on free-tier quota (429/503)."""
+    """Gemini call with automatic model fallback + retry on free-tier quota (429/503).
+
+    Models that recently returned a capacity/quota error are skipped for a few
+    minutes, which keeps scans fast instead of re-probing an exhausted model.
+    """
     primary = model_name()
     candidates: list[str] = [primary]
     backup = fallback_model()
@@ -81,15 +99,19 @@ async def generate(contents, config: types.GenerateContentConfig):
         if m not in candidates:
             candidates.append(m)
 
+    # Prefer models that are not currently on cooldown.
+    ordered = [m for m in candidates if not _on_cooldown(m)] + [m for m in candidates if _on_cooldown(m)]
+
     last_exc: AIError | None = None
-    for m in candidates:
+    for m in ordered:
         try:
-            return await _generate_once(contents, config, m)
+            result = await _generate_once(contents, config, m)
+            return result
         except AIError as exc:
             last_exc = exc
-            # Only move on for capacity / model-availability problems; real errors
-            # (invalid image, key rejected) won't be fixed by switching models.
             if exc.kind in ("busy", "key", "error"):
+                if exc.kind == "busy":
+                    _cooldown(m)
                 logger.info("model %s unavailable (%s); trying next model", m, exc.kind)
                 continue
             raise

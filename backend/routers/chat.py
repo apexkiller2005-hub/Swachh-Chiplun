@@ -94,12 +94,19 @@ async def chat_with_agent(input: ChatRequest, member: dict = Depends(rate_limit(
             },
         },
     )])
-    config = types.GenerateContentConfig(
+    _cfg = dict(
         system_instruction=system,
         temperature=0.4,
         tools=[tool],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
+    if hasattr(types, "ThinkingConfig"):
+        try:
+            types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0))
+            _cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass
+    config = types.GenerateContentConfig(**_cfg)
 
     parts = []
     history_lines = [

@@ -94,13 +94,13 @@ export default function Scan() {
   };
 
   const grabFrame = (source: HTMLVideoElement | HTMLImageElement, w: number, h: number) => {
-    const max = 1024;
+    const max = 768;
     const scale = Math.min(1, max / Math.max(w, h));
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(w * scale);
     canvas.height = Math.round(h * scale);
     canvas.getContext("2d")?.drawImage(source, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", 0.85);
+    return canvas.toDataURL("image/jpeg", 0.8);
   };
 
   const capture = () => {

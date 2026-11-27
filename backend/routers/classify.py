@@ -114,12 +114,20 @@ async def classify_item(input: ClassificationRequest, member: dict = Depends(rat
             raise HTTPException(status_code=422, detail="The photo could not be read — please retake it.")
         contents.insert(0, types.Part.from_bytes(data=image_bytes, mime_type=input.mime_type))
 
-    config = types.GenerateContentConfig(
+    _cfg = dict(
         system_instruction=system,
         temperature=0.2,
         response_mime_type="application/json",
         response_schema=response_schema(categories),
     )
+    # Disable "thinking" tokens for faster, cheaper classification when supported.
+    if hasattr(types, "ThinkingConfig"):
+        try:
+            types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0))
+            _cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            pass
+    config = types.GenerateContentConfig(**_cfg)
     data = None
     try:
         for _attempt in range(2):  # validate every result; retry once if invalid
