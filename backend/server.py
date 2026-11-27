@@ -29,9 +29,12 @@ async def lifespan(app: FastAPI):
     # Idempotent seed: ensures the curated Chiplun facilities + default guidelines exist
     # (insert-if-missing, so admin edits are never overwritten). Runs on every boot so a
     # fresh Render/Mongo database is never empty.
-    with suppress(Exception):
+    try:
         import seed as _seed
         await _seed.main()
+        logger.info("seed: completed successfully")
+    except Exception as exc:
+        logger.exception("seed: FAILED - %s", exc)
     yield
     app.state.index_task.cancel()  # stop a build still running before its client closes
     with suppress(asyncio.CancelledError):
