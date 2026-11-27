@@ -126,6 +126,41 @@ async def health():
     }
 
 
+# Cached AI self-test (public, so we can diagnose Render's Gemini key without auth).
+_AI_CHECK_CACHE: dict = {"at": 0.0, "result": None}
+_AI_CHECK_TTL = 300.0
+
+
+@api_router.get("/health/ai")
+async def health_ai():
+    import time
+
+    from lib.gemini import AIError, generate, is_configured, model_name
+    from google.genai import types
+
+    now = time.time()
+    if _AI_CHECK_CACHE["result"] is not None and now - _AI_CHECK_CACHE["at"] < _AI_CHECK_TTL:
+        return _AI_CHECK_CACHE["result"]
+    if not is_configured():
+        result = {"ok": False, "kind": "key", "message": "GEMINI_API_KEY is empty on the server.", "model": model_name()}
+        _AI_CHECK_CACHE["at"] = now
+        _AI_CHECK_CACHE["result"] = result
+        return result
+    try:
+        reply = await generate(
+            [types.Part.from_text(text="Reply with the single word OK.")],
+            types.GenerateContentConfig(temperature=0),
+        )
+        result = {"ok": True, "model": model_name(), "reply": (reply.text or "").strip()[:40]}
+    except AIError as exc:
+        result = {"ok": False, "kind": exc.kind, "status": exc.status, "message": exc.message, "model": model_name()}
+    except Exception as exc:  # never leak secrets; report the class only
+        result = {"ok": False, "kind": "error", "message": f"{type(exc).__name__}: {str(exc)[:200]}", "model": model_name()}
+    _AI_CHECK_CACHE["at"] = now
+    _AI_CHECK_CACHE["result"] = result
+    return result
+
+
 app.include_router(clerk_router)  # /api/clerk/config and /api/__clerk/*
 
 # Include the router in the main app
