@@ -132,7 +132,6 @@ async def health():
         "clerk_mode": clerk_mode,
         "clerk_keys_match": keys_match,
         "cors_origins": cors_origins,
-        "code_marker": "f332911-seed-v1",
     }
 
 
@@ -169,18 +168,6 @@ async def health_ai():
     _AI_CHECK_CACHE["at"] = now
     _AI_CHECK_CACHE["result"] = result
     return result
-
-
-@api_router.get("/debug/seed")
-async def debug_seed():
-    try:
-        import seed as _seed
-        await _seed.main()
-        count = await db.facilities.count_documents({})
-        return {"ok": True, "facility_count": count}
-    except Exception as exc:
-        import traceback
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "trace": traceback.format_exc()[-1500:]}
 
 
 app.include_router(clerk_router)  # /api/clerk/config and /api/__clerk/*
