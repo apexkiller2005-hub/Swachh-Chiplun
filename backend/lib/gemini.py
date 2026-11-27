@@ -15,7 +15,10 @@ from google.genai import errors, types
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+# gemini-3.5-flash's free tier is only ~20 requests/day, which is too small for an
+# app. gemini-3.1-flash-lite is multimodal (images + text), supports structured
+# output and function calling, and has a much larger free quota.
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 FRIENDLY = {
     "busy": "AI is busy, please try again in a minute.",
