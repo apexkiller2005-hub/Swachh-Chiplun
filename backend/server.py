@@ -91,7 +91,7 @@ api_router.include_router(doorstep.router)  # Doorstep Garbage Vehicle (DEMO)
 
 @api_router.get("/health")
 async def health():
-    """Public health check: database + AI configuration (never returns secrets)."""
+    """Public health check: database, AI and Clerk configuration (never returns secrets)."""
     from lib.db import db as _db
     from lib.gemini import is_configured, model_name
 
@@ -100,7 +100,30 @@ async def health():
         db_ok = True
     except Exception:
         db_ok = False
-    return {"status": "ok" if db_ok else "degraded", "database": db_ok, "ai_configured": is_configured(), "ai_model": model_name(), "ai_fallback_model": os.environ.get("GEMINI_FALLBACK_MODEL", "")}
+
+    pk = os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip()
+    sk = os.environ.get("CLERK_SECRET_KEY", "").strip()
+    keys_match = (pk.startswith("pk_live_") and sk.startswith("sk_live_")) or (
+        pk.startswith("pk_test_") and sk.startswith("sk_test_")
+    )
+    if pk.startswith("pk_live_"):
+        clerk_mode = "live"
+    elif pk.startswith("pk_test_"):
+        clerk_mode = "test"
+    else:
+        clerk_mode = "missing"
+
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "database": db_ok,
+        "ai_configured": is_configured(),
+        "ai_model": model_name(),
+        "ai_fallback_model": os.environ.get("GEMINI_FALLBACK_MODEL", ""),
+        "clerk_configured": bool(pk and sk),
+        "clerk_mode": clerk_mode,
+        "clerk_keys_match": keys_match,
+        "cors_origins": cors_origins,
+    }
 
 
 app.include_router(clerk_router)  # /api/clerk/config and /api/__clerk/*
@@ -108,10 +131,24 @@ app.include_router(clerk_router)  # /api/clerk/config and /api/__clerk/*
 # Include the router in the main app
 app.include_router(api_router)
 
+def _env_list(name: str, default: str = "") -> list[str]:
+    """Comma-separated env value -> clean list (quotes, spaces and trailing slashes removed).
+
+    Render/Vercel dashboards often store values as `"https://app.vercel.app"`; the
+    literal quotes would otherwise make every CORS origin check fail.
+    """
+    raw = os.environ.get(name, default)
+    return [item.strip().strip('"').strip("'").rstrip("/") for item in raw.split(",") if item.strip()]
+
+
+cors_origins = _env_list("CORS_ORIGINS", "*") or ["*"]
+cors_origin_regex = os.environ.get("CORS_ORIGIN_REGEX", "").strip() or None
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=cors_origins,
+    allow_origin_regex=cors_origin_regex,
     allow_methods=["*"],
     allow_headers=["*"],
 )

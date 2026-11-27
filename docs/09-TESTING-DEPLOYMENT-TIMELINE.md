@@ -57,10 +57,15 @@ external dependencies — both degrade gracefully by design.
    (Free tier sleeps after 15 min idle — first request wakes it in ~30 s.)
 3. **Frontend — Vercel/Netlify free**
    Import repo → root `frontend` → build `yarn build` → output `dist`.
-   The frontend calls relative `/api/...`; add a rewrite so production keeps
-   working (`vercel.json` in `frontend/`):
+   The frontend calls relative `/api/...`, so production needs a rewrite.
+   `frontend/vercel.json` already ships one — replace the placeholder with your
+   Render URL (and keep the SPA fallback so `/sign-in` and `/admin` survive a
+   refresh). Full walkthrough: `docs/13-DEPLOYMENT-VERCEL-RENDER.md`.
    ```json
-   { "rewrites": [{ "source": "/api/:path*", "destination": "https://<your-backend>.onrender.com/api/:path*" }] }
+   { "rewrites": [
+     { "source": "/api/:path*", "destination": "https://<your-backend>.onrender.com/api/:path*" },
+     { "source": "/(.*)", "destination": "/index.html" }
+   ] }
    ```
 4. **Post-deploy checklist**: unlock with PIN → classify a preset → facilities
    load → chat replies → run `python backend/seed.py` once against Atlas

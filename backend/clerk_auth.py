@@ -51,14 +51,37 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _public_origin(request: Request) -> str:
+    """The browser-facing origin, even when the API is reached through a proxy/rewrite."""
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    host = host.split(",")[0].strip()
+    proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip() or "https"
+    return f"{proto}://{host}" if host else ""
+
+
+def _proxy_url(request: Request) -> str:
+    """Absolute URL Clerk should call for its Frontend API.
+
+    `CLERK_PROXY_URL` wins — set it to `https://<frontend-domain>/api/__clerk` when
+    the frontend (Vercel) and API (Render) are separate hosts. Otherwise derive it
+    from the forwarded host so a Vercel rewrite keeps Clerk on the frontend origin
+    (required for first-party session cookies).
+    """
+    configured = os.environ.get("CLERK_PROXY_URL", "").strip()
+    if configured:
+        return configured.rstrip("/")
+    origin = _public_origin(request)
+    return f"{origin}{PROXY_PATH}" if origin else PROXY_PATH
+
+
 @clerk_router.get("/clerk/config")
-def clerk_config():
+def clerk_config(request: Request):
     """What the frontend needs to start Clerk (the publishable key is public)."""
     key = _publishable_key()
     return {
         "enabled": bool(key and _secret_key()),
         "publishable_key": key,
-        "proxy_url": PROXY_PATH if _is_production() else "",
+        "proxy_url": _proxy_url(request) if _is_production() else "",
     }
 
 
@@ -67,9 +90,8 @@ async def clerk_proxy(path: str, request: Request):
     """Relay Clerk's Frontend API through this app's own domain."""
     if not _is_production():
         raise HTTPException(status_code=404)
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS}
-    headers["Clerk-Proxy-Url"] = f"https://{host.split(',')[0].strip()}{PROXY_PATH}"
+    headers["Clerk-Proxy-Url"] = _proxy_url(request)
     headers["Clerk-Secret-Key"] = _secret_key()
     headers["X-Forwarded-For"] = _client_ip(request)
     headers["Accept-Encoding"] = "gzip"  # requests cannot decode brotli

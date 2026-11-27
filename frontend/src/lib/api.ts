@@ -1,8 +1,13 @@
 // Typed fetch layer over the FastAPI backend. Base is the relative "/api" prefix so the
 // same code works in dev (Vite proxies /api → :8001) and behind a single origin in prod.
-// Backend address from frontend/.env (VITE_BACKEND_URL, e.g. http://localhost:8001).
-// Empty = same server (the Vite /api proxy, and inside Emergent).
-export const API_BASE = `${(import.meta.env.VITE_BACKEND_URL ?? "").replace(/\/+$/, "")}/api`;
+//
+// VITE_BACKEND_URL is a DEVELOPMENT convenience only (e.g. http://localhost:8001).
+// Production always uses the relative /api path: frontend/vercel.json rewrites it to
+// Render, which keeps API calls — and Clerk's session cookie — on the frontend origin.
+// Ignoring the variable in production means a stale Vercel env var can no longer break
+// the deploy with CORS errors or a cross-origin Clerk proxy.
+const backendUrl = import.meta.env.DEV ? (import.meta.env.VITE_BACKEND_URL ?? "") : "";
+export const API_BASE = `${backendUrl.replace(/\/+$/, "")}/api`;
 const BASE = API_BASE;
 
 // Fields are declared, not constructor parameter properties: tsconfig sets

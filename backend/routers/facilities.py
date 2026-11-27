@@ -100,8 +100,9 @@ async def refresh_osm(lat: float, lng: float) -> None:
             res = await client.post(OVERPASS_URL, content=f"data={query}", headers={"Content-Type": "text/plain"})
             res.raise_for_status()
             elements = res.json().get("elements", [])
-        if docs:
+        if elements:
             now = datetime.now(timezone.utc)
+            stored = 0
             for el in elements:
                 doc = map_osm_element(el)
                 if doc:
@@ -109,10 +110,11 @@ async def refresh_osm(lat: float, lng: float) -> None:
                     # upsert by id — never a bulk wipe of the collection in app code
                     # $set keeps an admin's activate/deactivate choice on refreshed points
                     await db.facilities.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+                    stored += 1
             # evict only stale OSM cache entries older than a week (narrow, age-filtered)
             stale_cutoff = now - timedelta(days=7)
             await db.facilities.delete_many({"source": "osm", "fetched_at": {"$lt": stale_cutoff}})
-            logger.info("refresh_osm: stored %d OSM facilities", len(docs))
+            logger.info("refresh_osm: stored %d OSM facilities", stored)
     except Exception as exc:
         logger.warning("refresh_osm failed (serving seed data only): %s", exc)
 

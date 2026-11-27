@@ -10,9 +10,23 @@ from pymongo import ASCENDING, DESCENDING, IndexModel
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-mongo_url = os.environ["MONGO_URL"]
+
+def _required_env(name: str) -> str:
+    """Fail with an actionable message instead of a bare KeyError on the host."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set. Add it to backend/.env locally, or to the environment "
+            "variables of your Render (backend) service. See docs/13-DEPLOYMENT-VERCEL-RENDER.md."
+        )
+    return value
+
+
+mongo_url = _required_env("MONGO_URL")
+# DB_NAME has a sensible default so a missing variable cannot take the API down.
+db_name = os.environ.get("DB_NAME", "").strip() or "swachh_chiplun"
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+db = client[db_name]
 
 logger = logging.getLogger(__name__)
 

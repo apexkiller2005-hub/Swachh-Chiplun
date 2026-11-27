@@ -16,7 +16,10 @@ from fastapi import Depends, HTTPException
 from pymongo import ReturnDocument
 from starlette.concurrency import run_in_threadpool
 
-from clerk_auth import require_user
+try:  # launched from backend/ (the documented Render start command)
+    from clerk_auth import require_user
+except ModuleNotFoundError:  # launched as `backend.server` from the repo root
+    from backend.clerk_auth import require_user
 from lib.db import db
 
 logger = logging.getLogger(__name__)
