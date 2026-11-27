@@ -79,16 +79,30 @@ export default function Facilities() {
 
   const locate = () => {
     if (!navigator.geolocation) {
-      toast.error("Geolocation not supported — showing Chiplun centre");
+      toast.error("Location is not supported by this browser — showing Chiplun centre");
       return;
     }
+    if (!window.isSecureContext) {
+      toast.error("Location needs HTTPS — showing Chiplun centre");
+      return;
+    }
+    toast.info("Requesting your location…");
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
         mapRef.current?.setView([pos.coords.latitude, pos.coords.longitude], 13);
         toast.success("Showing facilities near you");
       },
-      () => toast.error("Location permission denied — showing Chiplun centre"),
+      (err) => {
+        const msg =
+          err.code === 1
+            ? "Location permission denied — enable it in browser settings"
+            : err.code === 2
+              ? "Location unavailable — showing Chiplun centre"
+              : "Location request timed out — showing Chiplun centre";
+        toast.error(msg);
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 },
     );
   };
 
