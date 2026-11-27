@@ -91,13 +91,17 @@ async def generate(contents, config: types.GenerateContentConfig):
     minutes, which keeps scans fast instead of re-probing an exhausted model.
     """
     primary = model_name()
-    candidates: list[str] = [primary]
-    backup = fallback_model()
-    if backup and backup not in candidates:
-        candidates.append(backup)
+    # Try the known-good (fresh-quota) models first, then the configured model.
+    # This avoids probing an exhausted configured model on every cold request.
+    candidates: list[str] = []
     for m in MODEL_FALLBACKS:
         if m not in candidates:
             candidates.append(m)
+    if primary not in candidates:
+        candidates.append(primary)
+    backup = fallback_model()
+    if backup and backup not in candidates:
+        candidates.append(backup)
 
     # Prefer models that are not currently on cooldown.
     ordered = [m for m in candidates if not _on_cooldown(m)] + [m for m in candidates if _on_cooldown(m)]
