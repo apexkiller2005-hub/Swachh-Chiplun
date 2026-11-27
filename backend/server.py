@@ -129,6 +129,7 @@ async def health():
         "clerk_mode": clerk_mode,
         "clerk_keys_match": keys_match,
         "cors_origins": cors_origins,
+        "code_marker": "f332911-seed-v1",
     }
 
 
