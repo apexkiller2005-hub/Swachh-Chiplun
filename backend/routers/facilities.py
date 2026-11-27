@@ -1,5 +1,6 @@
 """GET /api/facilities — category-based facility finder (curated Chiplun seed + live OpenStreetMap)."""
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -96,10 +97,20 @@ async def refresh_osm(lat: float, lng: float) -> None:
             return
     try:
         query = OVERPASS_QUERY.format(radius=SEARCH_RADIUS_M, lat=lat, lng=lng)
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post(OVERPASS_URL, content=f"data={query}", headers={"Content-Type": "text/plain"})
-            res.raise_for_status()
-            elements = res.json().get("elements", [])
+        elements = []
+        urls = [OVERPASS_URL, "https://overpass.kumi.systems/api/interpreter"]
+        headers = {"Content-Type": "text/plain", "User-Agent": "SwachhChiplun/1.0", "Accept": "*/*"}
+        for url in urls:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    res = await client.post(url, content=f"data={query}", headers=headers)
+                    res.raise_for_status()
+                    elements = res.json().get("elements", [])
+                    if elements:
+                        break
+            except Exception:
+                elements = []
+                continue
         if elements:
             now = datetime.now(timezone.utc)
             stored = 0
@@ -128,7 +139,12 @@ async def find_facilities(
     lat = CHIPLUN_LAT if lat is None else lat
     lng = CHIPLUN_LNG if lng is None else lng
     if live:
-        await refresh_osm(lat, lng)
+        # Fire-and-forget: don't block the response on a flaky OSM mirror.
+        # Seed data is served immediately; OSM points (if any) appear on the next load.
+        try:
+            asyncio.create_task(refresh_osm(lat, lng))
+        except RuntimeError:
+            await refresh_osm(lat, lng)
 
     # deactivated facilities (admin panel) are hidden from citizens and the chat agent
     docs = await db.facilities.find({"active": {"$ne": False}}, {"_id": 0}).to_list(500)

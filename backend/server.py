@@ -26,6 +26,12 @@ async def lifespan(app: FastAPI):
     from lib.auth import move_retired_roles
     with suppress(Exception):
         await move_retired_roles()
+    # Idempotent seed: ensures the curated Chiplun facilities + default guidelines exist
+    # (insert-if-missing, so admin edits are never overwritten). Runs on every boot so a
+    # fresh Render/Mongo database is never empty.
+    with suppress(Exception):
+        import seed as _seed
+        await _seed.main()
     yield
     app.state.index_task.cancel()  # stop a build still running before its client closes
     with suppress(asyncio.CancelledError):
