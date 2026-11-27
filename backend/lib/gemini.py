@@ -64,19 +64,43 @@ def client() -> genai.Client:
     return _client
 
 
+# Free-tier quotas are per model and per day. When the configured model is
+# exhausted (429) or unavailable (404/503), walk this list until one answers.
+# Each entry must support the features we use: images, structured output, tools.
+MODEL_FALLBACKS = ["gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.6-flash"]
+
+
 async def generate(contents, config: types.GenerateContentConfig):
-    """Gemini call with one automatic retry when the free tier is busy (429/503)."""
-    try:
-        return await _generate_once(contents, config, model_name())
-    except AIError as exc:
-        if exc.kind != "busy":
+    """Gemini call with automatic model fallback + retry on free-tier quota (429/503)."""
+    primary = model_name()
+    candidates: list[str] = [primary]
+    backup = fallback_model()
+    if backup and backup not in candidates:
+        candidates.append(backup)
+    for m in MODEL_FALLBACKS:
+        if m not in candidates:
+            candidates.append(m)
+
+    last_exc: AIError | None = None
+    for m in candidates:
+        try:
+            return await _generate_once(contents, config, m)
+        except AIError as exc:
+            last_exc = exc
+            # Only move on for capacity / model-availability problems; real errors
+            # (invalid image, key rejected) won't be fixed by switching models.
+            if exc.kind in ("busy", "key", "error"):
+                logger.info("model %s unavailable (%s); trying next model", m, exc.kind)
+                continue
             raise
-        backup = fallback_model()
-        if backup and backup != model_name():
-            # free-tier quota of the main model used up -> switch to the backup model
-            return await _generate_once(contents, config, backup)
-        await asyncio.sleep(3)
-        return await _generate_once(contents, config, model_name())
+    # Every model was busy — wait briefly and retry the primary once.
+    await asyncio.sleep(3)
+    try:
+        return await _generate_once(contents, config, primary)
+    except AIError:
+        if last_exc is not None:
+            raise last_exc
+        raise
 
 
 async def _generate_once(contents, config: types.GenerateContentConfig, model: str):
